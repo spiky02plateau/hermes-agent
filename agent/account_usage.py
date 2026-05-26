@@ -85,6 +85,32 @@ def _format_reset(dt: Optional[datetime]) -> str:
     return f"{rel} ({local_dt.strftime('%Y-%m-%d %H:%M %Z')})"
 
 
+def _visual_usage_bar(used_percent: float, *, width: int = 20) -> str:
+    used = max(0.0, min(100.0, float(used_percent)))
+    filled = max(0, min(width, int(round((used / 100.0) * width))))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def _window_total_seconds(label: str) -> Optional[int]:
+    normalized = str(label or "").strip().lower()
+    if "week" in normalized:
+        return 7 * 24 * 60 * 60
+    if normalized in {"session", "current session", "five_hour", "five hour", "5h"} or "5h" in normalized:
+        return 5 * 60 * 60
+    return None
+
+
+def _time_pace_percent(window: AccountUsageWindow) -> Optional[int]:
+    if not window.reset_at:
+        return None
+    total_seconds = _window_total_seconds(window.label)
+    if not total_seconds:
+        return None
+    remaining_seconds = (window.reset_at - _utc_now()).total_seconds()
+    elapsed_seconds = max(0.0, min(float(total_seconds), float(total_seconds) - remaining_seconds))
+    return max(0, min(100, int(round((elapsed_seconds / float(total_seconds)) * 100))))
+
+
 def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, markdown: bool = False) -> list[str]:
     if not snapshot:
         return []
@@ -95,17 +121,22 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
     else:
         lines.append(f"Provider: {snapshot.provider}")
     for window in snapshot.windows:
+        pace_percent: Optional[int] = None
         if window.used_percent is None:
             base = f"{window.label}: unavailable"
         else:
-            remaining = max(0, round(100 - float(window.used_percent)))
-            used = max(0, round(float(window.used_percent)))
-            base = f"{window.label}: {remaining}% remaining ({used}% used)"
+            used = max(0, min(100, round(float(window.used_percent))))
+            base = f"{window.label}: {used}% used"
+            pace_percent = _time_pace_percent(window)
         if window.reset_at:
             base += f" • resets {_format_reset(window.reset_at)}"
         elif window.detail:
             base += f" • {window.detail}"
         lines.append(base)
+        if window.used_percent is not None:
+            lines.append(_visual_usage_bar(float(window.used_percent)))
+            if pace_percent is not None:
+                lines.append(f"time pace: ┊{pace_percent}%")
     for detail in snapshot.details:
         lines.append(detail)
     if snapshot.unavailable_reason:

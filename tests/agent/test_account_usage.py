@@ -151,3 +151,40 @@ def test_codex_usage_treats_wham_used_percent_as_used_not_remaining(monkeypatch)
     assert "14% used" in rendered
     assert "15% used" not in rendered
     assert "86% used" not in rendered
+
+
+def test_render_account_usage_shows_reduced_visual_used_bars_with_time_pace(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 5, 26, 22, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(account_usage, "_utc_now", lambda: now)
+    snapshot = account_usage.AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=now,
+        plan="Plus",
+        windows=(
+            account_usage.AccountUsageWindow(
+                label="Session",
+                used_percent=57,
+                reset_at=now + timedelta(hours=3, minutes=57),
+            ),
+            account_usage.AccountUsageWindow(
+                label="Weekly",
+                used_percent=9,
+                reset_at=now + timedelta(days=4, hours=14, minutes=45),
+            ),
+        ),
+    )
+
+    lines = account_usage.render_account_usage_lines(snapshot, markdown=True)
+
+    rendered = "\n".join(lines)
+    assert "Session: 57% used" in rendered
+    assert "Weekly: 9% used" in rendered
+    assert "43% remaining" not in rendered
+    assert "91% remaining" not in rendered
+    assert "▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░" in lines
+    assert "▓▓░░░░░░░░░░░░░░░░░░" in lines
+    assert "time pace: ┊21%" in lines
+    assert "time pace: ┊34%" in lines
