@@ -153,7 +153,7 @@ def test_codex_usage_treats_wham_used_percent_as_used_not_remaining(monkeypatch)
     assert "86% used" not in rendered
 
 
-def test_render_account_usage_shows_reduced_visual_used_bars_with_time_pace(monkeypatch):
+def test_render_account_usage_shows_overlay_pace_marker_and_compact_reset(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
     now = datetime(2026, 5, 26, 22, 0, tzinfo=timezone.utc)
@@ -184,7 +184,12 @@ def test_render_account_usage_shows_reduced_visual_used_bars_with_time_pace(monk
     assert "Weekly: 9% used" in rendered
     assert "43% remaining" not in rendered
     assert "91% remaining" not in rendered
-    assert "▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░" in lines
-    assert "▓▓░░░░░░░░░░░░░░░░░░" in lines
+    assert "CEST" not in rendered
+    assert "UTC" not in rendered
+    assert " • resets" not in rendered
+    assert "▓▓▓▓[]▓▓▓▓▓▓▓░░░░░░░░░" in lines
+    assert "▓▓░░░░[]░░░░░░░░░░░░░░" in lines
     assert "time pace: ┊21%" in lines
     assert "time pace: ┊34%" in lines
+    assert "resets in 3h 57m" in lines
+    assert any(line.startswith("(05/27 ") and line.endswith(":57)") for line in lines)

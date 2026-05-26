@@ -72,7 +72,7 @@ def _format_reset(dt: Optional[datetime]) -> str:
     delta = dt - _utc_now()
     total_seconds = int(delta.total_seconds())
     if total_seconds <= 0:
-        return f"now ({local_dt.strftime('%Y-%m-%d %H:%M %Z')})"
+        return f"now ({local_dt.strftime('%m/%d %H:%M')})"
     hours, rem = divmod(total_seconds, 3600)
     minutes = rem // 60
     if hours >= 24:
@@ -82,13 +82,17 @@ def _format_reset(dt: Optional[datetime]) -> str:
         rel = f"in {hours}h {minutes}m"
     else:
         rel = f"in {minutes}m"
-    return f"{rel} ({local_dt.strftime('%Y-%m-%d %H:%M %Z')})"
+    return f"{rel}\n({local_dt.strftime('%m/%d %H:%M')})"
 
 
-def _visual_usage_bar(used_percent: float, *, width: int = 20) -> str:
+def _visual_usage_bar(used_percent: float, pace_percent: Optional[int] = None, *, width: int = 20) -> str:
     used = max(0.0, min(100.0, float(used_percent)))
     filled = max(0, min(width, int(round((used / 100.0) * width))))
-    return "▓" * filled + "░" * (width - filled)
+    bar = "▓" * filled + "░" * (width - filled)
+    if pace_percent is None:
+        return bar
+    marker_index = max(0, min(width, int((max(0, min(100, pace_percent)) / 100.0) * width)))
+    return bar[:marker_index] + "[]" + bar[marker_index:]
 
 
 def _window_total_seconds(label: str) -> Optional[int]:
@@ -129,14 +133,21 @@ def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, mark
             base = f"{window.label}: {used}% used"
             pace_percent = _time_pace_percent(window)
         if window.reset_at:
-            base += f" • resets {_format_reset(window.reset_at)}"
-        elif window.detail:
+            reset_text = _format_reset(window.reset_at)
+        else:
+            reset_text = None
+        if window.detail:
             base += f" • {window.detail}"
         lines.append(base)
         if window.used_percent is not None:
-            lines.append(_visual_usage_bar(float(window.used_percent)))
+            lines.append(_visual_usage_bar(float(window.used_percent), pace_percent))
             if pace_percent is not None:
                 lines.append(f"time pace: ┊{pace_percent}%")
+        if reset_text:
+            reset_lines = reset_text.split("\n", 1)
+            lines.append(f"resets {reset_lines[0]}")
+            if len(reset_lines) > 1:
+                lines.append(reset_lines[1])
     for detail in snapshot.details:
         lines.append(detail)
     if snapshot.unavailable_reason:
