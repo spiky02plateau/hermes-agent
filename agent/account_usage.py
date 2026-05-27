@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import httpx
 
@@ -21,6 +21,7 @@ class AccountUsageWindow:
     used_percent: Optional[float] = None
     reset_at: Optional[datetime] = None
     detail: Optional[str] = None
+    window_seconds: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class AccountUsageSnapshot:
     fetched_at: datetime
     title: str = "Account limits"
     plan: Optional[str] = None
+    account_label: Optional[str] = None
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
     unavailable_reason: Optional[str] = None
@@ -65,51 +67,120 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     return None
 
 
-def _format_reset(dt: Optional[datetime]) -> str:
+def _format_reset_relative(dt: Optional[datetime]) -> str:
     if not dt:
         return "unknown"
-    local_dt = dt.astimezone()
     delta = dt - _utc_now()
     total_seconds = int(delta.total_seconds())
     if total_seconds <= 0:
-        return f"now ({local_dt.strftime('%Y-%m-%d %H:%M %Z')})"
+        return "now"
     hours, rem = divmod(total_seconds, 3600)
     minutes = rem // 60
     if hours >= 24:
         days, hours = divmod(hours, 24)
-        rel = f"in {days}d {hours}h"
-    elif hours > 0:
-        rel = f"in {hours}h {minutes}m"
-    else:
-        rel = f"in {minutes}m"
-    return f"{rel} ({local_dt.strftime('%Y-%m-%d %H:%M %Z')})"
+        return f"in {days}d {hours}h"
+    if hours > 0:
+        return f"in {hours}h {minutes}m"
+    return f"in {minutes}m"
 
 
-def render_account_usage_lines(snapshot: Optional[AccountUsageSnapshot], *, markdown: bool = False) -> list[str]:
-    if not snapshot:
-        return []
-    header = f"📈 {'**' if markdown else ''}{snapshot.title}{'**' if markdown else ''}"
-    lines = [header]
+def _format_reset_compact(dt: Optional[datetime]) -> str:
+    if not dt:
+        return ""
+    return dt.astimezone().strftime("%m/%d %H:%M")
+
+
+def _format_reset(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "unknown"
+    compact = _format_reset_compact(dt)
+    return f"{_format_reset_relative(dt)} ({compact})" if compact else _format_reset_relative(dt)
+
+
+AccountUsageResult = Union[AccountUsageSnapshot, tuple[AccountUsageSnapshot, ...]]
+
+
+def _format_window_duration(seconds: Optional[int]) -> Optional[str]:
+    if not seconds or seconds <= 0:
+        return None
+    if seconds % 604800 == 0:
+        weeks = seconds // 604800
+        return "Weekly" if weeks == 1 else f"{weeks}w"
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return f"{days}d"
+    if seconds % 3600 == 0:
+        hours = seconds // 3600
+        return f"{hours}h"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def _window_time_pace_percent(window: AccountUsageWindow) -> Optional[int]:
+    if not window.reset_at or not window.window_seconds or window.window_seconds <= 0:
+        return None
+    elapsed = window.window_seconds - max(0.0, (window.reset_at - _utc_now()).total_seconds())
+    pace = (elapsed / window.window_seconds) * 100
+    return max(0, min(100, round(pace)))
+
+
+def _usage_bar(used_percent: Optional[float], pace_percent: Optional[int], *, width: int = 20) -> str:
+    used = max(0, min(100, round(float(used_percent or 0))))
+    filled = round((used / 100) * width)
+    bar = "▓" * filled + "░" * (width - filled)
+    if pace_percent is None:
+        return bar
+    marker = max(0, min(width, round((pace_percent / 100) * width)))
+    return bar[:marker] + "[]" + bar[marker:]
+
+
+def _render_single_account_usage_lines(snapshot: AccountUsageSnapshot, *, markdown: bool) -> list[str]:
+    lines: list[str] = []
+    provider_line = f"Provider: {snapshot.provider}"
+    if snapshot.account_label:
+        provider_line += f" · {snapshot.account_label}"
     if snapshot.plan:
-        lines.append(f"Provider: {snapshot.provider} ({snapshot.plan})")
-    else:
-        lines.append(f"Provider: {snapshot.provider}")
+        provider_line += f" ({snapshot.plan})"
+    lines.append(provider_line)
     for window in snapshot.windows:
+        duration = _format_window_duration(window.window_seconds)
+        display_label = window.label
+        if duration and duration.lower() != window.label.lower():
+            display_label = f"{window.label} / {duration}"
         if window.used_percent is None:
-            base = f"{window.label}: unavailable"
-        else:
-            remaining = max(0, round(100 - float(window.used_percent)))
-            used = max(0, round(float(window.used_percent)))
-            base = f"{window.label}: {remaining}% remaining ({used}% used)"
+            lines.append(f"{display_label}: unavailable")
+            continue
+        used = max(0, min(100, round(float(window.used_percent))))
+        pace = _window_time_pace_percent(window)
+        lines.append(f"{display_label}: {used}% used")
+        lines.append(_usage_bar(used, pace))
+        if pace is not None:
+            lines.append(f"time pace: ┊{pace}%")
         if window.reset_at:
-            base += f" • resets {_format_reset(window.reset_at)}"
+            lines.append(f"resets {_format_reset(window.reset_at)}")
         elif window.detail:
-            base += f" • {window.detail}"
-        lines.append(base)
+            lines.append(window.detail)
     for detail in snapshot.details:
         lines.append(detail)
     if snapshot.unavailable_reason:
         lines.append(f"Unavailable: {snapshot.unavailable_reason}")
+    return lines
+
+
+def render_account_usage_lines(snapshot: Optional[AccountUsageResult], *, markdown: bool = False) -> list[str]:
+    if not snapshot:
+        return []
+    snapshots = snapshot if isinstance(snapshot, tuple) else (snapshot,)
+    if not snapshots:
+        return []
+    header = f"📈 {'**' if markdown else ''}{snapshots[0].title}{'**' if markdown else ''}"
+    lines = [header]
+    for idx, item in enumerate(snapshots):
+        if idx:
+            lines.append("")
+        lines.extend(_render_single_account_usage_lines(item, markdown=markdown))
     return lines
 
 
@@ -157,22 +228,22 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
-def _fetch_codex_account_usage(
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-) -> Optional[AccountUsageSnapshot]:
-    token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "User-Agent": "codex-cli",
-    }
-    if account_id:
-        headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
-        response.raise_for_status()
-    payload = response.json() or {}
+def _codex_display_label(raw_label: Optional[str], index: int) -> str:
+    normalized = str(raw_label or "").strip().lower()
+    if index == 0 and normalized.startswith("openai-codex-oauth"):
+        return "primary"
+    if "backup" in normalized:
+        return "backup"
+    if normalized:
+        return str(raw_label).strip()
+    return "primary" if index == 0 else f"account {index + 1}"
+
+
+def _codex_snapshot_from_payload(
+    payload: dict[str, Any],
+    *,
+    account_label: Optional[str] = None,
+) -> AccountUsageSnapshot:
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
     for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
@@ -180,11 +251,14 @@ def _fetch_codex_account_usage(
         used = window.get("used_percent")
         if used is None:
             continue
+        raw_window_seconds = window.get("limit_window_seconds")
+        window_seconds = int(raw_window_seconds) if isinstance(raw_window_seconds, (int, float)) else None
         windows.append(
             AccountUsageWindow(
                 label=label,
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
+                window_seconds=window_seconds,
             )
         )
     details: list[str] = []
@@ -200,9 +274,73 @@ def _fetch_codex_account_usage(
         source="usage_api",
         fetched_at=_utc_now(),
         plan=_title_case_slug(payload.get("plan_type")),
+        account_label=account_label,
         windows=tuple(windows),
         details=tuple(details),
     )
+
+
+def _fetch_codex_single_account_usage(
+    token: str,
+    resolved_base_url: str,
+    *,
+    account_id: Optional[str] = None,
+    account_label: Optional[str] = None,
+) -> AccountUsageSnapshot:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "codex-cli",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
+        response.raise_for_status()
+    return _codex_snapshot_from_payload(response.json() or {}, account_label=account_label)
+
+
+def _codex_pool_entries_for_usage():
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    available_entries = getattr(pool, "_available_entries", None)
+    if callable(available_entries):
+        entries = available_entries(clear_expired=True, refresh=True)
+    else:
+        entries = pool.entries() if hasattr(pool, "entries") else []
+    return [entry for entry in entries if str(getattr(entry, "runtime_api_key", "") or "").strip()]
+
+
+def _fetch_codex_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageResult]:
+    if str(api_key or "").strip():
+        token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
+        return _fetch_codex_single_account_usage(token, resolved_base_url, account_id=account_id)
+
+    entries = _codex_pool_entries_for_usage()
+    if entries:
+        snapshots: list[AccountUsageSnapshot] = []
+        for index, entry in enumerate(entries):
+            try:
+                snapshots.append(
+                    _fetch_codex_single_account_usage(
+                        str(getattr(entry, "runtime_api_key", "") or "").strip(),
+                        str(getattr(entry, "runtime_base_url", None) or base_url or "").strip(),
+                        account_label=_codex_display_label(getattr(entry, "label", None), index),
+                    )
+                )
+            except Exception:
+                continue
+        if len(snapshots) > 1:
+            return tuple(snapshots)
+        if snapshots:
+            return snapshots[0]
+
+    token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
+    return _fetch_codex_single_account_usage(token, resolved_base_url, account_id=account_id)
 
 
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
@@ -343,7 +481,7 @@ def fetch_account_usage(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> Optional[AccountUsageSnapshot]:
+) -> Optional[AccountUsageResult]:
     normalized = str(provider or "").strip().lower()
     if normalized in {"", "auto", "custom"}:
         return None
