@@ -1,11 +1,11 @@
 """Tests for Telegram topic/thread routing fallbacks.
 
 Supergroup forum topics route with ``message_thread_id``. Hermes-created
-private DM topic lanes are different: live Telegram testing showed they only
-stay in the expected lane when sends include both the private topic
-``message_thread_id`` and a ``reply_to_message_id`` anchor to the triggering
-user message. If either anchor is unavailable or rejected, the adapter must
-avoid retrying with a partial topic route that can render outside the lane.
+private DM topic lanes use Bot API ``direct_messages_topic_id`` when Hermes
+has that explicit routing metadata; older fallback metadata without the Bot
+API topic id still uses ``message_thread_id`` plus a ``reply_to_message_id``
+anchor. The adapter must avoid partial topic routes that can render outside
+the requested lane.
 """
 
 import sys
@@ -598,8 +598,8 @@ async def test_send_uses_reply_fallback_for_hermes_dm_topics():
 
 
 @pytest.mark.asyncio
-async def test_send_uses_reply_anchor_when_direct_topic_fallback_metadata_exists():
-    """Restart/update replay metadata keeps the anchor authoritative when present."""
+async def test_send_uses_direct_topic_when_direct_topic_fallback_metadata_exists():
+    """Restart/update replay metadata keeps the Bot API DM topic authoritative."""
     adapter = _make_adapter()
     call_log = []
 
@@ -622,8 +622,67 @@ async def test_send_uses_reply_anchor_when_direct_topic_fallback_metadata_exists
 
     assert result.success is True
     assert call_log[0]["reply_to_message_id"] == 462
-    assert call_log[0]["message_thread_id"] == 20197
-    assert "direct_messages_topic_id" not in call_log[0]
+    assert call_log[0]["message_thread_id"] is None
+    assert call_log[0]["direct_messages_topic_id"] == 20197
+
+
+@pytest.mark.asyncio
+async def test_restart_success_notification_uses_direct_topic_metadata_for_dm_topic():
+    """Gateway /restart success pings must route to the initiating DM topic."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(kwargs)
+        return SimpleNamespace(message_id=777)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="♻ Gateway restarted successfully. Your session continues.",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "20197",
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] is None
+    assert call_log[0]["direct_messages_topic_id"] == 20197
+
+
+@pytest.mark.asyncio
+async def test_direct_topic_metadata_stays_authoritative_when_reply_mode_off():
+    """Turning replies off must not demote explicit Bot API DM-topic routing."""
+    adapter = _make_adapter()
+    adapter._reply_to_mode = "off"
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(kwargs)
+        return SimpleNamespace(message_id=778)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="restart complete",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "20197",
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] is None
+    assert call_log[0]["message_thread_id"] is None
+    assert call_log[0]["direct_messages_topic_id"] == 20197
 
 
 @pytest.mark.asyncio

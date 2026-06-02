@@ -405,7 +405,7 @@ async def test_send_restart_notification_with_thread(tmp_path, monkeypatch):
         "chat_id": "99",
         "chat_type": "dm",
         "thread_id": "777",
-        "message_id": "m2",
+        "message_id": "2",
     }))
 
     runner, adapter = make_restart_runner()
@@ -415,11 +415,12 @@ async def test_send_restart_notification_with_thread(tmp_path, monkeypatch):
 
     assert delivered_target == ("telegram", "99", "777")
     call_args = adapter.send.call_args
-    assert call_args[1]["metadata"] == {
+    metadata = call_args[1]["metadata"]
+    assert metadata == {
         "thread_id": "777",
         "telegram_dm_topic_reply_fallback": True,
         "direct_messages_topic_id": "777",
-        "telegram_reply_to_message_id": "m2",
+        "telegram_reply_to_message_id": "2",
     }
     assert not notify_path.exists()
 
