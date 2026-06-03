@@ -122,6 +122,26 @@ def format_runtime_footer(
     return _SEP.join(parts)
 
 
+def streamed_footer_edit_payload(
+    *,
+    final_text: str,
+    footer_line: str,
+    message_id: str | None,
+) -> tuple[str, str] | None:
+    """Return ``(message_id, content)`` for editing a streamed final reply.
+
+    Streaming may have already delivered the assistant body before the gateway
+    can compute token/cwd metadata.  If the stream consumer gives us an
+    editable message id, prefer a final edit that appends the footer to that
+    message over sending the footer as a standalone trailing message.
+    """
+    if not final_text or not footer_line or not message_id:
+        return None
+    if str(message_id) == "__no_edit__":
+        return None
+    return str(message_id), f"{final_text}\n\n{footer_line}"
+
+
 def build_footer_line(
     *,
     user_config: dict[str, Any] | None,

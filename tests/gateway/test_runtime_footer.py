@@ -13,6 +13,7 @@ from gateway.runtime_footer import (
     build_footer_line,
     format_runtime_footer,
     resolve_footer_config,
+    streamed_footer_edit_payload,
 )
 
 
@@ -260,3 +261,35 @@ def test_build_footer_no_data_returns_empty_even_when_enabled():
     # With no TERMINAL_CWD env either
     if not os.environ.get("TERMINAL_CWD"):
         assert out == ""
+
+
+def test_streamed_footer_edit_payload_appends_to_existing_final_message():
+    payload = streamed_footer_edit_payload(
+        final_text="Done.",
+        footer_line="gpt-5.5 · 123K/272K · 45% · ~/repo",
+        message_id="42",
+    )
+
+    assert payload == (
+        "42",
+        "Done.\n\ngpt-5.5 · 123K/272K · 45% · ~/repo",
+    )
+
+
+@pytest.mark.parametrize(
+    "final_text,footer_line,message_id",
+    [
+        ("", "footer", "42"),
+        ("Done.", "", "42"),
+        ("Done.", "footer", ""),
+        ("Done.", "footer", "__no_edit__"),
+    ],
+)
+def test_streamed_footer_edit_payload_requires_editable_message(
+    final_text, footer_line, message_id,
+):
+    assert streamed_footer_edit_payload(
+        final_text=final_text,
+        footer_line=footer_line,
+        message_id=message_id,
+    ) is None

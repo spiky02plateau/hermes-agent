@@ -9738,21 +9738,47 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
+                # Streaming already delivered the body text. Prefer editing the
+                # streamed final message to append the footer in-place; fall back
+                # to a small trailing message when the platform gave us no
+                # editable message id or the edit fails.
                 if _footer_line:
+                    _footer_sent = False
                     try:
-                        _foot_adapter = self.adapters.get(source.platform)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
-                                source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
+                        from gateway.runtime_footer import streamed_footer_edit_payload as _sfep
+                        _edit_payload = _sfep(
+                            final_text=response,
+                            footer_line=_footer_line,
+                            message_id=agent_result.get("stream_message_id"),
+                        )
                     except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
+                        logger.debug("streamed footer edit payload failed: %s", _e)
+                        _edit_payload = None
+                    if _edit_payload:
+                        try:
+                            _foot_adapter = self.adapters.get(source.platform)
+                            if _foot_adapter and hasattr(_foot_adapter, "edit_message"):
+                                _msg_id, _content = _edit_payload
+                                _edit_result = await _foot_adapter.edit_message(
+                                    chat_id=source.chat_id,
+                                    message_id=_msg_id,
+                                    content=_content,
+                                    finalize=True,
+                                )
+                                _footer_sent = bool(getattr(_edit_result, "success", False))
+                        except Exception as _e:
+                            logger.debug("streamed footer edit failed: %s", _e)
+                    if not _footer_sent:
+                        try:
+                            _foot_adapter = self.adapters.get(source.platform)
+                            if _foot_adapter:
+                                await _foot_adapter.send(
+                                    source.chat_id,
+                                    _footer_line,
+                                    metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                )
+                        except Exception as _e:
+                            logger.debug("trailing footer send failed: %s", _e)
                 return None
 
             return response
@@ -19024,6 +19050,9 @@ class GatewayRunner:
                     _content_delivered,
                 )
                 response["already_sent"] = True
+                _sc_msg_id = getattr(_sc, "message_id", None) if _sc is not None else None
+                if _sc_msg_id:
+                    response["stream_message_id"] = str(_sc_msg_id)
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
