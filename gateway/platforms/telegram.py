@@ -5894,7 +5894,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if thread_id_raw is not None:
             if chat_type == "group" and (is_topic_message or is_forum_group):
                 thread_id_str = str(thread_id_raw)
-            elif chat_type == "dm" and is_topic_message:
+            elif chat_type == "dm" and (
+                is_topic_message
+                or self._get_dm_topic_info(str(chat.id), str(thread_id_raw)) is not None
+            ):
                 thread_id_str = str(thread_id_raw)
         # For forum groups without an explicit topic, default to the
         # General-topic id so the gateway routes back to the General topic

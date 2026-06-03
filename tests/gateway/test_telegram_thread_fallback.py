@@ -169,6 +169,41 @@ def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
     assert build_session_key(event.source) == "agent:main:telegram:group:-100123:456"
 
 
+def test_private_dm_known_topic_preserves_thread_even_without_is_topic_flag():
+    """Telegram DM-topic updates may omit is_topic_message; known configured topics still route by thread."""
+    from gateway.platforms import telegram as telegram_mod
+
+    adapter = _make_adapter()
+    adapter._dm_topics = {"13670446:Jarvis": 405392}
+    adapter._dm_topics_config = [
+        {"chat_id": "13670446", "topics": [{"name": "Jarvis", "thread_id": 405392}]}
+    ]
+    message = SimpleNamespace(
+        text="/restart",
+        caption=None,
+        chat=SimpleNamespace(
+            id=13670446,
+            type=telegram_mod.ChatType.PRIVATE,
+            is_forum=False,
+            title=None,
+            full_name="Mr T",
+        ),
+        from_user=SimpleNamespace(id=13670446, full_name="Mr T"),
+        message_thread_id=405392,
+        is_topic_message=False,
+        reply_to_message=None,
+        message_id=67890,
+        date=None,
+    )
+
+    event = adapter._build_message_event(message, msg_type=MessageType.TEXT)
+
+    assert event.source.chat_id == "13670446"
+    assert event.source.chat_type == "dm"
+    assert event.source.thread_id == "405392"
+    assert build_session_key(event.source) == "agent:main:telegram:dm:13670446:405392"
+
+
 def test_forum_group_topic_message_preserves_thread_session_key():
     """Real Telegram forum-topic messages should still route by topic id."""
     from gateway.platforms import telegram as telegram_mod
