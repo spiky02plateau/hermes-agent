@@ -4,6 +4,8 @@ Long-term memory with knowledge graph, entity resolution, and multi-strategy
 retrieval. Supports cloud (API key) and local modes.
 
 Configurable request timeout via HINDSIGHT_TIMEOUT env var or config.json.
+Reflect/synthesis has a separate HINDSIGHT_REFLECT_TIMEOUT timeout because it
+can legitimately run longer than retain/recall.
 Configurable embedded daemon idle timeout via HINDSIGHT_IDLE_TIMEOUT env var
 or config.json idle_timeout.
 
@@ -16,6 +18,7 @@ Config via environment variables:
   HINDSIGHT_API_URL                — API endpoint
   HINDSIGHT_MODE                   — cloud or local (default: cloud)
   HINDSIGHT_TIMEOUT                — API request timeout in seconds (default: 120)
+  HINDSIGHT_REFLECT_TIMEOUT        — reflect/synthesis timeout in seconds (default: 300)
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
   HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import concurrent.futures
 import importlib
 import json
 import logging
@@ -51,6 +55,7 @@ _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+_DEFAULT_REFLECT_TIMEOUT = 300  # seconds — reflect is LLM synthesis and can run longer
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
@@ -324,6 +329,7 @@ def _load_config() -> dict:
         "mode": os.environ.get("HINDSIGHT_MODE", "cloud"),
         "apiKey": os.environ.get("HINDSIGHT_API_KEY", ""),
         "timeout": _parse_int_setting(os.environ.get("HINDSIGHT_TIMEOUT"), _DEFAULT_TIMEOUT),
+        "reflect_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_REFLECT_TIMEOUT"), _DEFAULT_REFLECT_TIMEOUT),
         "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
         "retain_tags": os.environ.get("HINDSIGHT_RETAIN_TAGS", ""),
         "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", ""),
@@ -781,6 +787,10 @@ class HindsightMemoryProvider(MemoryProvider):
         timeout_val = existing_timeout if existing_timeout is not None else _DEFAULT_TIMEOUT
         provider_config["timeout"] = timeout_val
         env_writes["HINDSIGHT_TIMEOUT"] = str(timeout_val)
+        existing_reflect_timeout = provider_config.get("reflect_timeout")
+        reflect_timeout_val = existing_reflect_timeout if existing_reflect_timeout is not None else _DEFAULT_REFLECT_TIMEOUT
+        provider_config["reflect_timeout"] = reflect_timeout_val
+        env_writes["HINDSIGHT_REFLECT_TIMEOUT"] = str(reflect_timeout_val)
         if mode == "local_embedded":
             existing_idle_timeout = provider_config.get("idle_timeout")
             idle_timeout_val = existing_idle_timeout if existing_idle_timeout is not None else _DEFAULT_IDLE_TIMEOUT
@@ -930,9 +940,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._client = Hindsight(**kwargs)
         return self._client
 
-    def _run_sync(self, coro):
+    def _run_sync(self, coro, timeout: float | None = None):
         """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+        return _run_sync(coro, timeout=timeout if timeout is not None else self._timeout)
 
     def _is_retriable_embedded_connection_error(self, exc: Exception) -> bool:
         """Return True for stale embedded-daemon connection failures."""
@@ -1016,22 +1026,27 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _run_hindsight_operation(self, operation):
+    def _run_hindsight_operation(self, operation, *, timeout: float | None = None, operation_name: str = "hindsight"):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         client = self._get_client()
         try:
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # A timed-out future may still be running on the shared loop and/or
+            # Hindsight backend. Do not auto-retry and risk duplicate synthesis.
+            raise
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
             logger.info(
-                "Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s",
+                "Hindsight embedded daemon appears unreachable during %s; recreating client and retrying once: %s",
+                operation_name,
                 exc,
             )
             self._client = None
             client = self._get_client()
             self._client = client
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1124,6 +1139,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _parse_int_setting(
             self._config.get("timeout") if self._config.get("timeout") is not None else os.environ.get("HINDSIGHT_TIMEOUT"),
             _DEFAULT_TIMEOUT,
+        )
+        self._reflect_timeout = _parse_int_setting(
+            self._config.get("reflect_timeout")
+            if self._config.get("reflect_timeout") is not None
+            else os.environ.get("HINDSIGHT_REFLECT_TIMEOUT"),
+            _DEFAULT_REFLECT_TIMEOUT,
         )
         self._idle_timeout = _parse_int_setting(
             self._config.get("idle_timeout") if self._config.get("idle_timeout") is not None else os.environ.get("HINDSIGHT_IDLE_TIMEOUT"),
@@ -1568,15 +1589,32 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
+                logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s, timeout=%s",
+                             self._bank_id, len(query), self._budget, self._reflect_timeout)
                 resp = self._run_hindsight_operation(
                     lambda client: client.areflect(
                         bank_id=self._bank_id, query=query, budget=self._budget
-                    )
+                    ),
+                    timeout=self._reflect_timeout,
+                    operation_name="hindsight_reflect",
                 )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
+            except concurrent.futures.TimeoutError:
+                message = (
+                    f"hindsight_reflect timed out after {self._reflect_timeout}s "
+                    f"(bank={self._bank_id}). The Hindsight backend operation may still be running; "
+                    "Hermes did not auto-retry to avoid duplicate synthesis. "
+                    "Check Hindsight operation/log state for eventual completion."
+                )
+                logger.warning(
+                    "hindsight_reflect timed out: bank=%s query_len=%d timeout=%s backend_may_continue=True auto_retry=False",
+                    self._bank_id,
+                    len(query),
+                    self._reflect_timeout,
+                    exc_info=True,
+                )
+                return tool_error(message)
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")

@@ -64,11 +64,12 @@ Config file: `~/.hermes/hindsight/config.json`
 | `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Banks API. |
 | `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Banks API. |
 
-### Recall
+### Recall and Reflect
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
+| `recall_budget` | `mid` | Recall/reflect thoroughness: `low` / `mid` / `high` |
+| `reflect_timeout` | `300` | Timeout, in seconds, for `hindsight_reflect` synthesis calls. Reflect uses this dedicated timeout; retain and recall continue to use `timeout` (default `120`). On timeout, Hermes reports that backend work may still be running and does not auto-retry. |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
@@ -139,7 +140,8 @@ Available in `hybrid` and `tools` memory modes:
 | `HINDSIGHT_API_LLM_BASE_URL` | LLM Base URL for local mode (e.g. OpenRouter) |
 | `HINDSIGHT_API_URL` | Override API endpoint |
 | `HINDSIGHT_BANK_ID` | Override bank name |
-| `HINDSIGHT_BUDGET` | Override recall budget |
+| `HINDSIGHT_BUDGET` | Override recall/reflect budget |
+| `HINDSIGHT_REFLECT_TIMEOUT` | Override `hindsight_reflect` timeout in seconds |
 | `HINDSIGHT_MODE` | Override mode (`cloud`, `local_embedded`, `local_external`) |
 
 ## Client Version

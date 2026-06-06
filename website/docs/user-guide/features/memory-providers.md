@@ -354,7 +354,8 @@ The setup wizard installs dependencies automatically and only installs what's ne
 |-----|---------|-------------|
 | `mode` | `cloud` | `cloud` or `local` |
 | `bank_id` | `hermes` | Memory bank identifier |
-| `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
+| `recall_budget` | `mid` | Recall and reflect thoroughness: `low` / `mid` / `high` |
+| `reflect_timeout` | `300` | Timeout, in seconds, for `hindsight_reflect` synthesis. Reflect has its own timeout; retain/recall continue using the generic provider timeout. On timeout, backend work may still be running and Hermes does not auto-retry. |
 | `memory_mode` | `hybrid` | `hybrid` (context + tools), `context` (auto-inject only), `tools` (tools only) |
 | `auto_retain` | `true` | Automatically retain conversation turns |
 | `auto_recall` | `true` | Automatically recall memories before each turn |

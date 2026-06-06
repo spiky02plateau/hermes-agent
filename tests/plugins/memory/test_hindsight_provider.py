@@ -40,7 +40,7 @@ def _clean_env(monkeypatch):
     for key in (
         "HINDSIGHT_API_KEY", "HINDSIGHT_API_URL", "HINDSIGHT_BANK_ID",
         "HINDSIGHT_BUDGET", "HINDSIGHT_MODE", "HINDSIGHT_TIMEOUT",
-        "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
+        "HINDSIGHT_REFLECT_TIMEOUT", "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
     ):
@@ -279,6 +279,19 @@ class TestConfig:
         assert cfg["banks"]["hermes"]["bankId"] == "env-bank"
         assert cfg["banks"]["hermes"]["budget"] == "high"
 
+    def test_reflect_timeout_from_config(self, provider_with_config):
+        p = provider_with_config(reflect_timeout=240)
+        assert p._reflect_timeout == 240
+
+    def test_reflect_timeout_from_env(self, provider_with_config, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_REFLECT_TIMEOUT", "180")
+        p = provider_with_config()
+        assert p._reflect_timeout == 180
+
+    def test_invalid_reflect_timeout_falls_back_to_default(self, provider_with_config):
+        p = provider_with_config(reflect_timeout="not-a-number")
+        assert p._reflect_timeout == 300
+
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
             "llm_provider": "openai",
@@ -348,6 +361,7 @@ class TestPostSetup:
         env_text = (hermes_home / ".env").read_text()
         assert "HINDSIGHT_LLM_API_KEY=sk-local-test\n" in env_text
         assert "HINDSIGHT_TIMEOUT=120\n" in env_text
+        assert "HINDSIGHT_REFLECT_TIMEOUT=300\n" in env_text
         assert "HINDSIGHT_IDLE_TIMEOUT=300\n" in env_text
 
         profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
@@ -551,9 +565,11 @@ class TestToolHandlers:
         ))
         assert "error" in result
 
-    def test_reflect_timeout_error_is_diagnostic(self, provider):
+    def test_reflect_timeout_error_is_diagnostic(self, provider, caplog):
         """Regression repro: TimeoutError stringifies empty at the current seam."""
-        def _raise_timeout(coro):
+        provider._reflect_timeout = 42
+
+        def _raise_timeout(coro, timeout=None):
             coro.close()
             raise concurrent.futures.TimeoutError()
 
@@ -568,6 +584,50 @@ class TestToolHandlers:
         assert "timed out" in result["error"].lower()
         assert "hindsight_reflect" in result["error"]
         assert provider._bank_id in result["error"]
+        assert "42s" in result["error"]
+        assert "may still be running" in result["error"]
+        assert "did not auto-retry" in result["error"]
+        assert "query_len=9" in caplog.text
+        assert "backend_may_continue=True" in caplog.text
+        assert "auto_retry=False" in caplog.text
+
+    def test_reflect_uses_reflect_timeout(self, provider):
+        timeouts = []
+        provider._timeout = 11
+        provider._reflect_timeout = 42
+
+        def _capture_timeout(coro, timeout=None):
+            coro.close()
+            timeouts.append(timeout)
+            return SimpleNamespace(text="Synthesized answer")
+
+        provider._run_sync = _capture_timeout
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "summarize"}
+        ))
+
+        assert result["result"] == "Synthesized answer"
+        assert timeouts == [42]
+
+    def test_recall_still_uses_generic_timeout(self, provider):
+        timeouts = []
+        provider._timeout = 11
+        provider._reflect_timeout = 42
+
+        def _capture_timeout(coro, timeout=None):
+            coro.close()
+            timeouts.append(timeout)
+            return SimpleNamespace(results=[SimpleNamespace(text="Memory")])
+
+        provider._run_sync = _capture_timeout
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "summarize"}
+        ))
+
+        assert result["result"] == "1. Memory"
+        assert timeouts == [None]
 
     def test_reflect_error_handling(self, provider):
         provider._client.areflect.side_effect = RuntimeError("connection failed")
