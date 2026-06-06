@@ -184,6 +184,7 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
 
     monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["/usr/bin/hermes"])
     monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
     monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/setsid" if cmd == "setsid" else None)
 
     def fake_popen(cmd, **kwargs):
@@ -202,6 +203,7 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     assert kwargs["start_new_session"] is True
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
+    assert "_HERMES_GATEWAY" not in kwargs["env"]
 
 
 # ── Shutdown notification tests ──────────────────────────────────────

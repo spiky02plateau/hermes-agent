@@ -149,6 +149,7 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        self._partial_final_prefix = ""
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
@@ -203,6 +204,22 @@ class GatewayStreamConsumer:
         """True when the final response content reached the user, even if
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
+
+    def undelivered_final_text(self, final_text: str) -> str:
+        """Return the tail of ``final_text`` not yet visible to the user.
+
+        Multipart final sends can partially succeed under Telegram flood
+        control.  Replaying the whole response duplicates already-visible
+        chunks; claiming success drops the tail.  This exposes the missing
+        tail so the gateway can deliver only what is still absent.
+        """
+        final_text = self._clean_for_display(final_text or "")
+        if self._final_response_sent or self._final_content_delivered:
+            return ""
+        prefix = self._partial_final_prefix or ""
+        if prefix and final_text.startswith(prefix):
+            return final_text[len(prefix):].lstrip()
+        return final_text
 
     async def _edit_message(
         self,
@@ -261,6 +278,7 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        self._partial_final_prefix = ""
         # #29346: a tool/segment boundary means what we delivered was an interim
         # preamble, not the final answer — clear the flags so a premature setter
         # can't fool the gateway. Safe: got_done returns before any reset, and
@@ -492,22 +510,30 @@ class GatewayStreamConsumer:
                         chunks = self.adapter.truncate_message(
                             self._accumulated, _safe_limit, len_fn=_len_fn,
                         )
-                        chunks_delivered = False
+                        delivered_chunks: list[str] = []
                         reply_to = self._message_id or self._initial_reply_to_id
                         for chunk in chunks:
                             new_id = await self._send_new_chunk(chunk, reply_to)
                             if new_id is not None and new_id != reply_to:
-                                chunks_delivered = True
+                                delivered_chunks.append(chunk)
+                                reply_to = new_id
+                            else:
+                                break
                         self._accumulated = ""
                         self._last_sent_text = ""
                         self._last_edit_time = time.monotonic()
                         if got_done:
-                            # Only claim final delivery if THESE chunks actually
-                            # landed.  ``_already_sent`` may be True from prior
-                            # tool-progress edits or fallback-mode promotion (#10748)
-                            # — that doesn't mean the final answer reached the user.
-                            self._final_response_sent = chunks_delivered
-                            if chunks_delivered:
+                            # Only claim final delivery if EVERY chunk landed.
+                            # A partial multipart send is neither failure nor
+                            # success: the gateway must replay only the unsent
+                            # tail to avoid both missing content and duplicate
+                            # already-visible chunks.
+                            all_chunks_delivered = len(delivered_chunks) == len(chunks)
+                            self._final_response_sent = all_chunks_delivered
+                            self._partial_final_prefix = (
+                                "" if all_chunks_delivered else "".join(delivered_chunks)
+                            )
+                            if all_chunks_delivered:
                                 self._final_content_delivered = True
                             return
                         if got_segment_break:

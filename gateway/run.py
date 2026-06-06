@@ -1723,6 +1723,45 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     return True
 
 
+def _stream_delivery_text(agent_result: dict, stream_consumer: Any) -> str:
+    """Return the body the gateway should send after incomplete streaming.
+
+    Normally this is the full final response.  If the stream consumer already
+    delivered a visible multipart prefix but did not confirm final delivery,
+    return only the missing tail so fallback/queued delivery does not replay
+    chunks the user can already see.
+    """
+    if not isinstance(agent_result, dict):
+        return ""
+    final_response = str(agent_result.get("final_response") or "")
+    if not final_response or stream_consumer is None:
+        return final_response
+    helper = getattr(stream_consumer, "undelivered_final_text", None)
+    if not callable(helper):
+        return final_response
+    try:
+        tail = str(helper(final_response) or "")
+    except Exception:
+        return final_response
+    return tail if tail else final_response
+
+
+def _queued_followup_first_response(result: dict | None) -> str:
+    """Return the first response body to flush before a queued follow-up.
+
+    If streaming partially delivered a multipart response while flood-control
+    delayed the stream task, prefer the recorded unsent tail over the full final
+    response.  That preserves queue ordering without replaying visible chunks.
+    """
+    if not isinstance(result, dict):
+        return ""
+    return str(
+        result.get("stream_delivery_response")
+        or result.get("final_response")
+        or ""
+    )
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -3964,6 +4003,8 @@ class GatewayRunner:
             return
 
         current_pid = os.getpid()
+        restart_env = os.environ.copy()
+        restart_env.pop("_HERMES_GATEWAY", None)
 
         # On Windows there's no bash/setsid chain — spawn a tiny Python
         # watcher directly via sys.executable instead.  The watcher polls
@@ -4028,6 +4069,7 @@ class GatewayRunner:
                 [sys.executable, "-c", watcher, str(current_pid), *cmd_argv],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=restart_env,
                 **windows_detach_popen_kwargs(),
             )
             return
@@ -4043,6 +4085,7 @@ class GatewayRunner:
                 [setsid_bin, "bash", "-lc", shell_cmd],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=restart_env,
                 start_new_session=True,
             )
         else:
@@ -4050,6 +4093,7 @@ class GatewayRunner:
                 ["bash", "-lc", shell_cmd],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=restart_env,
                 start_new_session=True,
             )
 
@@ -9453,6 +9497,11 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+            _stream_delivery_response = agent_result.get("stream_delivery_response")
+            if _stream_delivery_response:
+                response = _sanitize_gateway_final_response(
+                    source.platform, str(_stream_delivery_response),
+                )
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -9743,12 +9792,40 @@ class GatewayRunner:
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
+                # Prefer editing the already-streamed final message when the
+                # combined body+footer still fits one platform message; only fall
+                # back to a trailing footer when editing would be unsafe.
                 if _footer_line:
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
-                        if _foot_adapter:
+                        _footer_delivered = False
+                        _streamed_message_id = agent_result.get("streamed_message_id")
+                        if _foot_adapter and _streamed_message_id and response:
+                            try:
+                                from gateway.runtime_footer import append_footer_if_fits as _aff
+                                _raw_len_fn = getattr(_foot_adapter, "message_len_fn", len)
+                                if not callable(_raw_len_fn):
+                                    _raw_len_fn = len
+                                def _platform_len(text: str) -> int:
+                                    return int(_raw_len_fn(text))
+                                _max_len = int(getattr(_foot_adapter, "MAX_MESSAGE_LENGTH", 0) or 0)
+                                _combined = _aff(
+                                    response,
+                                    _footer_line,
+                                    max_message_length=_max_len,
+                                    len_fn=_platform_len,
+                                )
+                            except Exception:
+                                _combined = ""
+                            if _combined:
+                                _edit_result = await _foot_adapter.edit_message(
+                                    chat_id=source.chat_id,
+                                    message_id=str(_streamed_message_id),
+                                    content=_combined,
+                                    finalize=True,
+                                )
+                                _footer_delivered = bool(getattr(_edit_result, "success", False))
+                        if not _footer_delivered and _foot_adapter:
                             await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
@@ -10745,8 +10822,12 @@ class GatewayRunner:
         # under systemd (KillMode=mixed kills the cgroup) or Docker (tini
         # exits when the gateway dies, taking the detached helper with it).
         _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        _xpc_service_name = os.environ.get("XPC_SERVICE_NAME", "")
+        _under_launchd = sys.platform == "darwin" and _xpc_service_name.startswith(
+            "ai.hermes.gateway"
+        )
         _in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
-        if _under_service or _in_container:
+        if _under_service or _under_launchd or _in_container:
             self.request_restart(detached=False, via_service=True)
         else:
             self.request_restart(detached=True, via_service=False)
@@ -18334,6 +18415,9 @@ class GatewayRunner:
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "streamed_message_id": (
+                    _stream_consumer.message_id if _stream_consumer is not None else None
+                ),
             }
         
         # Start progress message sender if enabled
@@ -18834,7 +18918,7 @@ class GatewayRunner:
                         or _previewed
                         or (_sc and getattr(_sc, "final_content_delivered", False))
                     )
-                    first_response = result.get("final_response", "")
+                    first_response = _queued_followup_first_response(result)
                     if first_response and not _already_streamed:
                         try:
                             logger.info(
@@ -19004,6 +19088,9 @@ class GatewayRunner:
         _sc = stream_consumer_holder[0]
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
+            _delivery_text = _stream_delivery_text(response, _sc)
+            if _delivery_text and _delivery_text != _final:
+                response["stream_delivery_response"] = _delivery_text
             _is_empty_sentinel = not _final or _final == "(empty)"
             _streamed = bool(
                 _sc and getattr(_sc, "final_response_sent", False)

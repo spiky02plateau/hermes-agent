@@ -885,19 +885,19 @@ class TestFinalResponseDeliveryGuard:
         adapter.edit_message = AsyncMock(
             return_value=SimpleNamespace(success=True),
         )
-        adapter.MAX_MESSAGE_LENGTH = 100
+        adapter.MAX_MESSAGE_LENGTH = 600
         adapter.truncate_message = MagicMock(
-            side_effect=lambda text, limit: [text[:limit], text[limit:]],
+            side_effect=lambda text, limit, **kwargs: [text[:500], text[500:]],
         )
 
-        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, buffer_only=True)
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
 
         # Simulate prior tool-progress edits that set _already_sent
         consumer._already_sent = True
 
-        # Long text > MAX_MESSAGE_LENGTH, no existing message id (fresh send path)
-        long_text = "x" * 200
+        # Long text > safe split limit, no existing message id (fresh send path)
+        long_text = ("a" * 500) + ("b" * 500)
         consumer.on_delta(long_text)
         task = asyncio.create_task(consumer.run())
         await asyncio.sleep(0.05)
@@ -910,9 +910,40 @@ class TestFinalResponseDeliveryGuard:
         )
 
     @pytest.mark.asyncio
-    async def test_split_overflow_partial_send_marks_final_sent(self):
-        """Split-overflow path: if at least one chunk lands on done frame,
-        we did deliver the final answer — _final_response_sent must be True."""
+    async def test_split_overflow_partial_send_does_not_mark_final_sent(self):
+        """Split-overflow path: if only some chunks land on done frame,
+        the final answer is incomplete — _final_response_sent must stay False."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=False, error="flood_control:120"),
+        ])
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        adapter.MAX_MESSAGE_LENGTH = 600
+        adapter.truncate_message = MagicMock(
+            side_effect=lambda text, limit, **kwargs: [text[:500], text[500:]],
+        )
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, buffer_only=True)
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        long_text = ("a" * 500) + ("b" * 500)
+        consumer.on_delta(long_text)
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert consumer._final_response_sent is False
+        assert consumer._final_content_delivered is False
+        assert consumer.already_sent is True
+        assert consumer.undelivered_final_text(long_text) == "b" * 500
+
+    @pytest.mark.asyncio
+    async def test_split_overflow_all_chunks_mark_final_sent(self):
+        """Split-overflow path: all chunks must land before final delivery is confirmed."""
         adapter = MagicMock()
         adapter.send = AsyncMock(side_effect=[
             SimpleNamespace(success=True, message_id="msg_1"),
@@ -921,15 +952,15 @@ class TestFinalResponseDeliveryGuard:
         adapter.edit_message = AsyncMock(
             return_value=SimpleNamespace(success=True),
         )
-        adapter.MAX_MESSAGE_LENGTH = 100
+        adapter.MAX_MESSAGE_LENGTH = 600
         adapter.truncate_message = MagicMock(
-            side_effect=lambda text, limit: [text[:limit], text[limit:]],
+            side_effect=lambda text, limit, **kwargs: [text[:500], text[500:]],
         )
 
-        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, buffer_only=True)
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
 
-        long_text = "x" * 200
+        long_text = ("a" * 500) + ("b" * 500)
         consumer.on_delta(long_text)
         task = asyncio.create_task(consumer.run())
         await asyncio.sleep(0.05)
@@ -937,6 +968,8 @@ class TestFinalResponseDeliveryGuard:
         await task
 
         assert consumer._final_response_sent is True
+        assert consumer._final_content_delivered is True
+        assert consumer.undelivered_final_text(long_text) == ""
 
 
 class TestFinalContentDeliveredGuard:

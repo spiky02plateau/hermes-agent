@@ -26,7 +26,7 @@ piecemeal, the footer is sent as a separate trailing message via
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
@@ -147,3 +147,26 @@ def build_footer_line(
         cwd=cwd,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
+
+
+def append_footer_if_fits(
+    response: str,
+    footer: str,
+    *,
+    max_message_length: int,
+    len_fn: Callable[[str], int] = len,
+) -> str:
+    """Return ``response`` + footer when it fits one platform message.
+
+    Streaming normally sends the answer before ``gateway/run.py`` has the token
+    counts needed for the runtime footer.  If the already-streamed message can
+    still be edited to include the footer, this helper gives the exact combined
+    text; otherwise callers should keep the existing trailing-message fallback.
+    """
+    if not response or not footer or max_message_length <= 0:
+        return ""
+    combined = f"{response}\n\n{footer}"
+    try:
+        return combined if len_fn(combined) <= max_message_length else ""
+    except Exception:
+        return combined if len(combined) <= max_message_length else ""

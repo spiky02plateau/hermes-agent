@@ -10,6 +10,7 @@ import pytest
 from gateway.runtime_footer import (
     _home_relative_cwd,
     _model_short,
+    append_footer_if_fits,
     build_footer_line,
     format_runtime_footer,
     resolve_footer_config,
@@ -260,3 +261,40 @@ def test_build_footer_no_data_returns_empty_even_when_enabled():
     # With no TERMINAL_CWD env either
     if not os.environ.get("TERMINAL_CWD"):
         assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# append_footer_if_fits — used to avoid trailing footer messages after streaming
+# ---------------------------------------------------------------------------
+
+def test_append_footer_if_fits_returns_combined_when_under_limit():
+    out = append_footer_if_fits(
+        "Answer body",
+        "gpt-5.4 · 25% · ~/proj",
+        max_message_length=100,
+    )
+
+    assert out == "Answer body\n\ngpt-5.4 · 25% · ~/proj"
+
+
+def test_append_footer_if_fits_returns_empty_when_combined_exceeds_limit():
+    out = append_footer_if_fits(
+        "Answer body",
+        "gpt-5.4 · 25% · ~/proj",
+        max_message_length=len("Answer body\n\ngpt-5.4 · 25% · ~/proj") - 1,
+    )
+
+    assert out == ""
+
+
+def test_append_footer_if_fits_uses_platform_length_function():
+    # Telegram enforces UTF-16 code units, not Python codepoints. This locks
+    # the helper to the adapter's length function instead of len().
+    out = append_footer_if_fits(
+        "ok",
+        "🧠",
+        max_message_length=5,
+        len_fn=lambda text: len(text) + 1,
+    )
+
+    assert out == ""
