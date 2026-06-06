@@ -5,6 +5,7 @@ prefetch (auto_recall, preamble, query truncation), sync_turn (auto_retain,
 turn counting, tags), and schema completeness.
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -549,6 +550,32 @@ class TestToolHandlers:
             "hindsight_reflect", {}
         ))
         assert "error" in result
+
+    def test_reflect_timeout_error_is_diagnostic(self, provider):
+        """Regression repro: TimeoutError stringifies empty at the current seam."""
+        def _raise_timeout(coro):
+            coro.close()
+            raise concurrent.futures.TimeoutError()
+
+        provider._run_sync = _raise_timeout
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "summarize"}
+        ))
+
+        assert "error" in result
+        assert result["error"] != "Failed to reflect: "
+        assert "timed out" in result["error"].lower()
+        assert "hindsight_reflect" in result["error"]
+        assert provider._bank_id in result["error"]
+
+    def test_reflect_error_handling(self, provider):
+        provider._client.areflect.side_effect = RuntimeError("connection failed")
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_reflect", {"query": "summarize"}
+        ))
+        assert "error" in result
+        assert "connection failed" in result["error"]
 
     def test_unknown_tool(self, provider):
         result = json.loads(provider.handle_tool_call(
