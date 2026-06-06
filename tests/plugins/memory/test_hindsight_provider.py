@@ -292,6 +292,14 @@ class TestConfig:
         p = provider_with_config(reflect_timeout="not-a-number")
         assert p._reflect_timeout == 300
 
+    def test_recall_budget_high_from_config(self, provider_with_config):
+        p = provider_with_config(recall_budget="high")
+        assert p._budget == "high"
+
+    def test_invalid_recall_budget_falls_back_to_mid(self, provider_with_config):
+        p = provider_with_config(recall_budget="turbo")
+        assert p._budget == "mid"
+
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
             "llm_provider": "openai",
@@ -539,6 +547,18 @@ class TestToolHandlers:
         p.handle_tool_call("hindsight_recall", {"query": "test"})
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["types"] == ["world", "experience"]
+
+    def test_recall_passes_high_budget(self, provider_with_config):
+        p = provider_with_config(recall_budget="high")
+        p.handle_tool_call("hindsight_recall", {"query": "test"})
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert call_kwargs["budget"] == "high"
+
+    def test_reflect_passes_high_budget(self, provider_with_config):
+        p = provider_with_config(recall_budget="high")
+        p.handle_tool_call("hindsight_reflect", {"query": "test"})
+        call_kwargs = p._client.areflect.call_args.kwargs
+        assert call_kwargs["budget"] == "high"
 
     def test_recall_no_results(self, provider):
         provider._client.arecall.return_value = SimpleNamespace(results=[])
