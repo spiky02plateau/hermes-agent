@@ -17,7 +17,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from plugins.memory.hindsight import (
+    GET_DIRECTIVE_SCHEMA,
+    GET_MENTAL_MODEL_SCHEMA,
     HindsightMemoryProvider,
+    LIST_DIRECTIVES_SCHEMA,
+    LIST_MENTAL_MODELS_SCHEMA,
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
@@ -78,6 +82,18 @@ def _make_mock_client():
     )
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
+    client.list_mental_models = MagicMock(
+        return_value=[SimpleNamespace(id="mm-1", name="Operator model")]
+    )
+    client.get_mental_model = MagicMock(
+        return_value=SimpleNamespace(id="mm-1", name="Operator model")
+    )
+    client.list_directives = MagicMock(
+        return_value=[SimpleNamespace(id="dir-1", content="Be concise")]
+    )
+    client.get_directive = MagicMock(
+        return_value=SimpleNamespace(id="dir-1", content="Be concise")
+    )
     return client
 
 
@@ -175,11 +191,38 @@ class TestSchemas:
         assert REFLECT_SCHEMA["name"] == "hindsight_reflect"
         assert "query" in REFLECT_SCHEMA["parameters"]["properties"]
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_read_only_capability_schemas_are_list_get_only(self):
+        names = {
+            LIST_MENTAL_MODELS_SCHEMA["name"],
+            GET_MENTAL_MODEL_SCHEMA["name"],
+            LIST_DIRECTIVES_SCHEMA["name"],
+            GET_DIRECTIVE_SCHEMA["name"],
+        }
+        assert names == {
+            "hindsight_list_mental_models",
+            "hindsight_get_mental_model",
+            "hindsight_list_directives",
+            "hindsight_get_directive",
+        }
+        assert not any(
+            word in name
+            for name in names
+            for word in ("create", "update", "delete", "clear", "refresh")
+        )
+
+    def test_get_tool_schemas_returns_read_only_capability_tools(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 3
+        assert len(schemas) == 7
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert names == {
+            "hindsight_retain",
+            "hindsight_recall",
+            "hindsight_reflect",
+            "hindsight_list_mental_models",
+            "hindsight_get_mental_model",
+            "hindsight_list_directives",
+            "hindsight_get_directive",
+        }
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")
@@ -656,6 +699,61 @@ class TestToolHandlers:
         ))
         assert "error" in result
         assert "connection failed" in result["error"]
+
+    def test_list_mental_models_is_read_only(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_list_mental_models", {"tags": ["ops"]}
+        ))
+        assert result["result"] == [{"id": "mm-1", "name": "Operator model"}]
+        provider._client.list_mental_models.assert_called_once_with(
+            bank_id="test-bank", tags=["ops"]
+        )
+
+    def test_get_mental_model_is_read_only(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_get_mental_model", {"mental_model_id": "mm-1"}
+        ))
+        assert result["result"] == {"id": "mm-1", "name": "Operator model"}
+        provider._client.get_mental_model.assert_called_once_with(
+            bank_id="test-bank", mental_model_id="mm-1"
+        )
+
+    def test_get_mental_model_requires_id(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_get_mental_model", {}
+        ))
+        assert "error" in result
+
+    def test_list_directives_is_read_only(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_list_directives", {"tags": ["ops"]}
+        ))
+        assert result["result"] == [{"id": "dir-1", "content": "Be concise"}]
+        provider._client.list_directives.assert_called_once_with(
+            bank_id="test-bank", tags=["ops"]
+        )
+
+    def test_get_directive_is_read_only(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_get_directive", {"directive_id": "dir-1"}
+        ))
+        assert result["result"] == {"id": "dir-1", "content": "Be concise"}
+        provider._client.get_directive.assert_called_once_with(
+            bank_id="test-bank", directive_id="dir-1"
+        )
+
+    def test_mutating_capability_tools_are_not_exposed(self, provider):
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        assert "hindsight_create_mental_model" not in names
+        assert "hindsight_update_mental_model" not in names
+        assert "hindsight_delete_mental_model" not in names
+        assert "hindsight_create_directive" not in names
+        assert "hindsight_delete_directive" not in names
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_create_mental_model", {"name": "diagnostic"}
+        ))
+        assert "error" in result
+        assert "Unknown tool" in result["error"]
 
     def test_unknown_tool(self, provider):
         result = json.loads(provider.handle_tool_call(

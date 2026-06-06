@@ -294,6 +294,67 @@ REFLECT_SCHEMA = {
     },
 }
 
+LIST_MENTAL_MODELS_SCHEMA = {
+    "name": "hindsight_list_mental_models",
+    "description": "List Hindsight mental models for the active bank. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags to filter mental models.",
+            },
+        },
+    },
+}
+
+GET_MENTAL_MODEL_SCHEMA = {
+    "name": "hindsight_get_mental_model",
+    "description": "Get one Hindsight mental model by ID. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "mental_model_id": {"type": "string", "description": "Mental model ID to retrieve."},
+        },
+        "required": ["mental_model_id"],
+    },
+}
+
+LIST_DIRECTIVES_SCHEMA = {
+    "name": "hindsight_list_directives",
+    "description": "List Hindsight directives for the active bank. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags to filter directives.",
+            },
+        },
+    },
+}
+
+GET_DIRECTIVE_SCHEMA = {
+    "name": "hindsight_get_directive",
+    "description": "Get one Hindsight directive by ID. Read-only.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "directive_id": {"type": "string", "description": "Directive ID to retrieve."},
+        },
+        "required": ["directive_id"],
+    },
+}
+
+READ_ONLY_CAPABILITY_SCHEMAS = [
+    LIST_MENTAL_MODELS_SCHEMA,
+    GET_MENTAL_MODEL_SCHEMA,
+    LIST_DIRECTIVES_SCHEMA,
+    GET_DIRECTIVE_SCHEMA,
+]
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -380,6 +441,29 @@ def _normalize_retain_tags(value: Any) -> List[str]:
         seen.add(tag)
         normalized.append(tag)
     return normalized
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert Hindsight SDK objects into JSON-serializable values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _json_safe(model_dump())
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _json_safe(to_dict())
+    if hasattr(value, "__dict__"):
+        return {
+            str(k): _json_safe(v)
+            for k, v in vars(value).items()
+            if not str(k).startswith("_")
+        }
+    return str(value)
 
 
 def _utc_timestamp() -> str:
@@ -1048,6 +1132,16 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = client
             return self._run_sync(operation(client), timeout=timeout)
 
+    def _get_capability_client(self, method_name: str):
+        """Return a client object exposing a sync Hindsight capability method."""
+        client = self._get_client()
+        if hasattr(client, method_name):
+            return client
+        inner_client = getattr(client, "_client", None)
+        if inner_client is not None and hasattr(inner_client, method_name):
+            return inner_client
+        raise RuntimeError(f"Hindsight client does not expose {method_name}")
+
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
 
@@ -1534,7 +1628,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, *READ_ONLY_CAPABILITY_SCHEMAS]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -1618,6 +1712,50 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
+
+        elif tool_name == "hindsight_list_mental_models":
+            try:
+                tags = args.get("tags") or None
+                client = self._get_capability_client("list_mental_models")
+                result = client.list_mental_models(bank_id=self._bank_id, tags=tags)
+                return json.dumps({"result": _json_safe(result)})
+            except Exception as e:
+                logger.warning("hindsight_list_mental_models failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to list Hindsight mental models: {e}")
+
+        elif tool_name == "hindsight_get_mental_model":
+            mental_model_id = str(args.get("mental_model_id", "") or "").strip()
+            if not mental_model_id:
+                return tool_error("Missing required parameter: mental_model_id")
+            try:
+                client = self._get_capability_client("get_mental_model")
+                result = client.get_mental_model(bank_id=self._bank_id, mental_model_id=mental_model_id)
+                return json.dumps({"result": _json_safe(result)})
+            except Exception as e:
+                logger.warning("hindsight_get_mental_model failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to get Hindsight mental model: {e}")
+
+        elif tool_name == "hindsight_list_directives":
+            try:
+                tags = args.get("tags") or None
+                client = self._get_capability_client("list_directives")
+                result = client.list_directives(bank_id=self._bank_id, tags=tags)
+                return json.dumps({"result": _json_safe(result)})
+            except Exception as e:
+                logger.warning("hindsight_list_directives failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to list Hindsight directives: {e}")
+
+        elif tool_name == "hindsight_get_directive":
+            directive_id = str(args.get("directive_id", "") or "").strip()
+            if not directive_id:
+                return tool_error("Missing required parameter: directive_id")
+            try:
+                client = self._get_capability_client("get_directive")
+                result = client.get_directive(bank_id=self._bank_id, directive_id=directive_id)
+                return json.dumps({"result": _json_safe(result)})
+            except Exception as e:
+                logger.warning("hindsight_get_directive failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to get Hindsight directive: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 

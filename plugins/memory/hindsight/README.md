@@ -130,6 +130,12 @@ Available in `hybrid` and `tools` memory modes:
 | `hindsight_retain` | Store information with auto entity extraction; supports optional per-call `tags` |
 | `hindsight_recall` | Multi-strategy search (semantic + entity graph) |
 | `hindsight_reflect` | Cross-memory synthesis (LLM-powered) |
+| `hindsight_list_mental_models` | Read-only list of mental models in the active bank |
+| `hindsight_get_mental_model` | Read-only mental model lookup by ID |
+| `hindsight_list_directives` | Read-only list of directives in the active bank |
+| `hindsight_get_directive` | Read-only directive lookup by ID |
+
+Mutating capability tools (`create_*`, `update_*`, `refresh_*`, `delete_*`, `clear_*`, bank config/admin tools) are not exposed by default. Enablement of those operations requires a separate explicit approval path.
 
 ## Environment Variables
 
