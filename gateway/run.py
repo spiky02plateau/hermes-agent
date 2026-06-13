@@ -9616,9 +9616,10 @@ class GatewayRunner:
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
+            # Off by default (display.runtime_footer.enabled=false).  The
+            # native streaming path installs the same footer on the stream
+            # consumer before finish(), so this caller append is only for the
+            # non-streaming final-send path.
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
@@ -9870,21 +9871,6 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
-                    try:
-                        _foot_adapter = self.adapters.get(source.platform)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
-                                source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
-                    except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
                 return None
 
             return response
@@ -18423,15 +18409,6 @@ class GatewayRunner:
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
-            result_holder[0] = result
-
-            # Signal the stream consumer that the agent is done
-            if _stream_consumer is not None:
-                _stream_consumer.finish()
-            
-            # Return final response, or a message if something went wrong
-            final_response = result.get("final_response")
-
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
             _input_toks = 0
@@ -18444,6 +18421,30 @@ class GatewayRunner:
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+
+            result_holder[0] = result
+
+            # Return final response, or a message if something went wrong.
+            # Runtime footer for streamed replies must be installed before
+            # finish(): the consumer appends it to the true turn-final send/edit.
+            final_response = result.get("final_response")
+            if _stream_consumer is not None:
+                if final_response:
+                    try:
+                        from gateway.runtime_footer import build_footer_line as _bfl
+                        _stream_consumer.set_final_suffix(_bfl(
+                            user_config=user_config,
+                            platform_key=platform_key,
+                            model=_resolved_model,
+                            context_tokens=_last_prompt_toks,
+                            context_length=_context_length or None,
+                            cwd=os.environ.get("TERMINAL_CWD", ""),
+                        ))
+                    except Exception as _footer_err:
+                        logger.debug("runtime_footer stream suffix build failed: %s", _footer_err)
+                # Signal the stream consumer that the agent is done only after
+                # any final suffix is available.
+                _stream_consumer.finish()
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""

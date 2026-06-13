@@ -156,6 +156,10 @@ class GatewayStreamConsumer:
         # streaming, even if the final edit (cursor removal etc.)
         # subsequently failed.
         self._final_content_delivered = False
+        # Optional suffix appended only to the true turn-final streamed text.
+        # The gateway uses this for runtime metadata footers so the footer lands
+        # in the last assistant message instead of a separate trailing message.
+        self._final_suffix = ""
         # Cache adapter lifecycle capability: only platforms that need an
         # explicit finalize call (e.g. DingTalk AI Cards) force us to make
         # a redundant final edit.  Everyone else keeps the fast path.
@@ -293,6 +297,24 @@ class GatewayStreamConsumer:
     def finish(self) -> None:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
+
+    def set_final_suffix(self, text: str | None) -> None:
+        """Set text to append to the final streamed assistant message."""
+        self._final_suffix = (text or "").strip()
+
+    def _with_final_suffix(self, text: str) -> str:
+        """Return *text* with the final suffix appended once.
+
+        Empty content stays empty: a runtime footer should never create a
+        footer-only message when the model produced no final answer.
+        """
+        suffix = self._final_suffix
+        if not text or not text.strip() or not suffix:
+            return text
+        stripped = text.rstrip()
+        if stripped.endswith(suffix):
+            return text
+        return f"{stripped}\n\n{suffix}"
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -456,6 +478,7 @@ class GatewayStreamConsumer:
                 # tag is not lost.
                 if got_done:
                     self._flush_think_buffer()
+                    self._accumulated = self._with_final_suffix(self._accumulated)
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -769,6 +792,14 @@ class GatewayStreamConsumer:
         final_text = self._clean_for_display(text)
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
+        if self._final_suffix and continuation.strip() == self._final_suffix:
+            # The body is already visible and the only missing text would be the
+            # runtime footer.  Do not recreate the old bug as a footer-only
+            # fallback message; better to omit metadata than trail the answer.
+            self._already_sent = True
+            self._final_response_sent = True
+            self._final_content_delivered = True
+            return
         if not continuation.strip():
             # Nothing new to send — the visible partial already matches final text.
             # BUT: if final_text itself has meaningful content (e.g. a timeout

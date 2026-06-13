@@ -85,6 +85,108 @@ class TestCleanForDisplay:
         assert result == text
 
 
+# ── Final suffix / runtime footer ────────────────────────────────────────
+
+
+class TestFinalSuffix:
+    """Runtime footer suffix is folded into the turn-final streamed message."""
+
+    @pytest.mark.asyncio
+    async def test_finish_appends_suffix_to_single_final_send(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="msg_1",
+        ))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="", edit_interval=999, buffer_threshold=999),
+        )
+        consumer.set_final_suffix("gpt-test · 12% · ~/repo")
+
+        consumer.on_delta("hello")
+        task = asyncio.create_task(consumer.run())
+        consumer.finish()
+        await task
+
+        adapter.send.assert_awaited_once()
+        assert adapter.send.call_args.kwargs["content"] == (
+            "hello\n\ngpt-test · 12% · ~/repo"
+        )
+        assert adapter.edit_message.await_count == 0
+        assert not any(
+            call.kwargs.get("content") == "gpt-test · 12% · ~/repo"
+            for call in adapter.send.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_segment_break_suffix_only_lands_on_final_segment(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=True, message_id="msg_2"),
+        ])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="", edit_interval=999, buffer_threshold=999),
+        )
+        consumer.set_final_suffix("footer")
+
+        consumer.on_delta("pre-tool preamble")
+        task = asyncio.create_task(consumer.run())
+        consumer.on_segment_break()
+        await asyncio.sleep(0.05)
+        consumer.on_delta("final answer")
+        consumer.finish()
+        await task
+
+        sent_contents = [
+            call.kwargs["content"] for call in adapter.send.await_args_list
+        ]
+        assert sent_contents == [
+            "pre-tool preamble",
+            "final answer\n\nfooter",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fallback_omits_suffix_instead_of_footer_only_send(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SimpleNamespace(
+            success=True, message_id="msg_1",
+        ))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="", edit_interval=999, buffer_threshold=999),
+        )
+        consumer.set_final_suffix("footer")
+
+        consumer.on_delta("hello")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer._fallback_prefix = "hello"
+        consumer._fallback_final_send = True
+        consumer._edit_supported = False
+        consumer.finish()
+        await task
+
+        sent_contents = [
+            call.kwargs["content"] for call in adapter.send.await_args_list
+        ]
+        assert sent_contents == ["hello"]
+        assert consumer.final_response_sent is True
+
+
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 
 

@@ -15,12 +15,11 @@ Per-platform overrides live under ``display.platforms.<platform>.runtime_footer`
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
 and any gateway platform.
 
-The footer is appended to the final response text in ``gateway/run.py`` right
-before returning the response to the adapter send path — so it only lands on
-the final message a user sees, not on tool-progress updates or streaming
-partials.  When streaming is on and the final text has already been delivered
-piecemeal, the footer is sent as a separate trailing message via
-``send_trailing_footer()``.
+The footer is appended only to the final response text a user sees, never to
+tool-progress updates or streaming partials.  Non-streaming replies append it
+in ``gateway/run.py`` before the adapter send path; gateway streaming installs
+it as a final suffix on ``GatewayStreamConsumer`` before the consumer performs
+its turn-final send/edit.
 """
 
 from __future__ import annotations
