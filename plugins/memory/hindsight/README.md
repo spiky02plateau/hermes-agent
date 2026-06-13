@@ -61,8 +61,13 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
 | `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{platform}`, `{user}`, `{session}`. Example: `hermes-{profile}` isolates memory per active Hermes profile. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
-| `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Banks API. |
-| `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Banks API. |
+| `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Best-effort syncs to the bank's `reflect_mission` through the Banks API on provider startup. |
+| `bank_retain_mission` | — | Retain mission (steers what gets extracted). Best-effort syncs to the bank's `retain_mission` through the Banks API on provider startup. |
+| `bank_sync_timeout` | `5` | Timeout in seconds for optional bank metadata sync. Clamped to 1–30 seconds and independent from normal memory operation timeout. |
+
+Bank mission sync is startup-safe and fail-open. Hermes first tries the wrapped bank config update route, then falls back to the bank metadata endpoint when that route is unavailable or gated. Unsupported endpoints, warmup races, timeouts, and HTTP failures leave retain/recall/reflect usable and log only the bank id, field names, endpoint class, and status/error type — not mission text or API keys. In `local_embedded` mode, sync runs after the embedded daemon reports readiness.
+
+Because sync writes bank metadata when the API is reachable, use a disposable bank/profile for smoke tests unless you explicitly want the configured bank's `reflect_mission` / `retain_mission` updated.
 
 ### Recall
 
@@ -141,6 +146,7 @@ Available in `hybrid` and `tools` memory modes:
 | `HINDSIGHT_BANK_ID` | Override bank name |
 | `HINDSIGHT_BUDGET` | Override recall budget |
 | `HINDSIGHT_MODE` | Override mode (`cloud`, `local_embedded`, `local_external`) |
+| `HINDSIGHT_BANK_SYNC_TIMEOUT` | Override optional bank metadata sync timeout |
 
 ## Client Version
 

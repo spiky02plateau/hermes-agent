@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -42,6 +43,7 @@ def _clean_env(monkeypatch):
         "HINDSIGHT_IDLE_TIMEOUT", "HINDSIGHT_LLM_API_KEY",
         "HINDSIGHT_RETAIN_TAGS", "HINDSIGHT_RETAIN_SOURCE",
         "HINDSIGHT_RETAIN_USER_PREFIX", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX",
+        "HINDSIGHT_BANK_SYNC_TIMEOUT",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -322,6 +324,318 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+
+
+class TestBankMissionSync:
+    def _provider_with_sync_config(self, tmp_path, monkeypatch, **overrides):
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://hindsight.example/api/",
+            "bank_id": "test bank/with spaces",
+            "budget": "mid",
+            "memory_mode": "hybrid",
+            "bank_mission": "Reflect on product decisions",
+            "bank_retain_mission": "Extract durable facts only",
+        }
+        config.update(overrides)
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        return HindsightMemoryProvider()
+
+    def _join_bank_sync(self, provider):
+        thread = getattr(provider, "_bank_sync_thread", None)
+        if thread is not None:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+
+    def _install_fake_embedded_runtime(self, monkeypatch, events):
+        class FakeClient:
+            url = "http://127.0.0.1:4567"
+
+            def __init__(self):
+                self._manager = SimpleNamespace(is_running=lambda profile: False)
+
+            def _ensure_started(self):
+                events.append("started")
+
+        monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=lambda **kwargs: FakeClient()))
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight_embed",
+            SimpleNamespace(
+                daemon_embed_manager=sys.modules["hindsight_embed.daemon_embed_manager"]
+                if "hindsight_embed.daemon_embed_manager" in sys.modules
+                else SimpleNamespace(console=None)
+            ),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hindsight_embed.daemon_embed_manager",
+            SimpleNamespace(console=None),
+        )
+        monkeypatch.setitem(sys.modules, "rich", SimpleNamespace())
+        monkeypatch.setitem(
+            sys.modules,
+            "rich.console",
+            SimpleNamespace(Console=lambda **kwargs: SimpleNamespace()),
+        )
+
+    def test_cloud_initialization_does_not_wait_for_bank_sync(self, tmp_path, monkeypatch):
+        patch_started = threading.Event()
+        release_patch = threading.Event()
+        initialize_done = threading.Event()
+        calls = []
+
+        def fake_patch(url, payload, *, api_key=None, timeout=None):
+            calls.append({"url": url, "payload": payload, "api_key": api_key, "timeout": timeout})
+            patch_started.set()
+            release_patch.wait(timeout=5)
+            return 200
+
+        monkeypatch.setattr("plugins.memory.hindsight._patch_hindsight_json", fake_patch)
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch)
+
+        init_thread = threading.Thread(
+            target=lambda: (provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli"), initialize_done.set()),
+            daemon=True,
+        )
+        init_thread.start()
+
+        assert initialize_done.wait(timeout=0.2)
+        assert init_thread.is_alive() is False
+        assert patch_started.wait(timeout=5)
+        assert calls == [
+            {
+                "url": "http://hindsight.example/api/v1/default/banks/test%20bank%2Fwith%20spaces/config",
+                "payload": {
+                    "updates": {
+                        "reflect_mission": "Reflect on product decisions",
+                        "retain_mission": "Extract durable facts only",
+                    }
+                },
+                "api_key": "test-key",
+                "timeout": 5,
+            }
+        ]
+        release_patch.set()
+        self._join_bank_sync(provider)
+
+    def test_configured_missions_sync_to_bank_fields(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_patch(url, payload, *, api_key=None, timeout=None):
+            calls.append({"url": url, "payload": payload, "api_key": api_key, "timeout": timeout})
+            return 200
+
+        monkeypatch.setattr("plugins.memory.hindsight._patch_hindsight_json", fake_patch)
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch)
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        assert calls == [
+            {
+                "url": "http://hindsight.example/api/v1/default/banks/test%20bank%2Fwith%20spaces/config",
+                "payload": {
+                    "updates": {
+                        "reflect_mission": "Reflect on product decisions",
+                        "retain_mission": "Extract durable facts only",
+                    }
+                },
+                "api_key": "test-key",
+                "timeout": 5,
+            }
+        ]
+
+    def test_no_mission_fields_skips_bank_sync(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._patch_hindsight_json",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+        provider = self._provider_with_sync_config(
+            tmp_path,
+            monkeypatch,
+            bank_mission="",
+            bank_retain_mission="   ",
+        )
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        assert calls == []
+
+    @pytest.mark.parametrize("config_status", [401, 403, 404, 405, 422])
+    def test_config_route_unavailable_falls_back_to_quoted_bank_endpoint(self, tmp_path, monkeypatch, config_status):
+        calls = []
+
+        def fake_patch(url, payload, *, api_key=None, timeout=None):
+            calls.append({"url": url, "payload": payload, "api_key": api_key, "timeout": timeout})
+            return config_status if url.endswith("/config") else 200
+
+        monkeypatch.setattr("plugins.memory.hindsight._patch_hindsight_json", fake_patch)
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch)
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        assert [call["url"] for call in calls] == [
+            "http://hindsight.example/api/v1/default/banks/test%20bank%2Fwith%20spaces/config",
+            "http://hindsight.example/api/v1/default/banks/test%20bank%2Fwith%20spaces",
+        ]
+        assert calls[1]["payload"] == {
+            "reflect_mission": "Reflect on product decisions",
+            "retain_mission": "Extract durable facts only",
+        }
+
+    def test_bank_id_template_resolved_bank_is_synced(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._patch_hindsight_json",
+            lambda url, payload, **kwargs: calls.append((url, payload)) or 405,
+        )
+        provider = self._provider_with_sync_config(
+            tmp_path,
+            monkeypatch,
+            bank_id="fallback-bank",
+            bank_id_template="hermes-{profile}-{platform}",
+        )
+
+        provider.initialize(
+            session_id="test-session",
+            hermes_home=str(tmp_path),
+            platform="telegram",
+            agent_identity="Jarvis Ops",
+        )
+        self._join_bank_sync(provider)
+
+        assert provider._bank_id == "hermes-Jarvis-Ops-telegram"
+        assert calls[1][0] == "http://hindsight.example/api/v1/default/banks/hermes-Jarvis-Ops-telegram"
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({"bank_retain_mission": ""}, {"reflect_mission": "Reflect on product decisions"}),
+            ({"bank_mission": ""}, {"retain_mission": "Extract durable facts only"}),
+            ({"bank_mission": "  ", "bank_retain_mission": "\t"}, None),
+        ],
+    )
+    def test_empty_mission_values_are_omitted(self, tmp_path, monkeypatch, overrides, expected):
+        calls = []
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._patch_hindsight_json",
+            lambda url, payload, **kwargs: calls.append(payload) or 200,
+        )
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch, **overrides)
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        if expected is None:
+            assert calls == []
+        else:
+            assert calls[0]["updates"] == expected
+
+    @pytest.mark.parametrize("status", [404, 405, 422, 500])
+    def test_sync_http_failures_do_not_abort_initialization(self, tmp_path, monkeypatch, status, caplog):
+        def fake_patch(url, payload, *, api_key=None, timeout=None):
+            return status
+
+        monkeypatch.setattr("plugins.memory.hindsight._patch_hindsight_json", fake_patch)
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch)
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        assert provider._bank_id == "test bank/with spaces"
+        assert "Reflect on product decisions" not in caplog.text
+        assert "Extract durable facts only" not in caplog.text
+        assert "test-key" not in caplog.text
+
+    def test_sync_exception_does_not_abort_initialization(self, tmp_path, monkeypatch, caplog):
+        def fake_patch(url, payload, *, api_key=None, timeout=None):
+            raise RuntimeError("boom with sentinel-secret-value")
+
+        monkeypatch.setattr("plugins.memory.hindsight._patch_hindsight_json", fake_patch)
+        provider = self._provider_with_sync_config(
+            tmp_path,
+            monkeypatch,
+            apiKey="sentinel-api-key",
+            bank_mission="sentinel-mission-text",
+            bank_retain_mission="sentinel-retain-text",
+        )
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        assert provider._bank_id == "test bank/with spaces"
+        assert "sentinel-mission-text" not in caplog.text
+        assert "sentinel-retain-text" not in caplog.text
+        assert "sentinel-api-key" not in caplog.text
+
+    def test_cloud_initialization_uses_dedicated_sync_timeout(self, tmp_path, monkeypatch):
+        timeouts = []
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._patch_hindsight_json",
+            lambda url, payload, **kwargs: timeouts.append(kwargs["timeout"]) or 200,
+        )
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch, timeout=120, bank_sync_timeout=2)
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        assert timeouts == [2]
+
+    def test_local_external_initialization_triggers_sync(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._patch_hindsight_json",
+            lambda url, payload, **kwargs: calls.append((url, payload)) or 200,
+        )
+        provider = self._provider_with_sync_config(
+            tmp_path,
+            monkeypatch,
+            mode="local_external",
+            api_url="http://localhost:8888/",
+            apiKey="",
+        )
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        self._join_bank_sync(provider)
+
+        assert calls[0][0] == "http://localhost:8888/v1/default/banks/test%20bank%2Fwith%20spaces/config"
+
+    def test_local_embedded_sync_runs_after_daemon_ready(self, tmp_path, monkeypatch):
+        events = []
+        self._install_fake_embedded_runtime(monkeypatch, events)
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._patch_hindsight_json",
+            lambda url, payload, **kwargs: events.append(("sync", url)) or 200,
+        )
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch, mode="local_embedded")
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        provider._daemon_start_thread.join(timeout=5)
+
+        assert events == ["started", ("sync", "http://127.0.0.1:4567/v1/default/banks/test%20bank%2Fwith%20spaces/config")]
+
+    def test_local_embedded_sync_failure_does_not_fail_daemon_start(self, tmp_path, monkeypatch):
+        events = []
+        self._install_fake_embedded_runtime(monkeypatch, events)
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._patch_hindsight_json",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("connection refused")),
+        )
+        provider = self._provider_with_sync_config(tmp_path, monkeypatch, mode="local_embedded")
+
+        provider.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        provider._daemon_start_thread.join(timeout=5)
+
+        assert events == ["started"]
 
 
 class TestPostSetup:

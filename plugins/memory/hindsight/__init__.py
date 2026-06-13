@@ -16,6 +16,7 @@ Config via environment variables:
   HINDSIGHT_API_URL                — API endpoint
   HINDSIGHT_MODE                   — cloud or local (default: cloud)
   HINDSIGHT_TIMEOUT                — API request timeout in seconds (default: 120)
+  HINDSIGHT_BANK_SYNC_TIMEOUT      — best-effort bank metadata sync timeout in seconds (default: 5)
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
   HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
@@ -52,6 +53,9 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+_DEFAULT_BANK_SYNC_TIMEOUT = 5  # seconds — optional bank metadata sync must not block startup
+_MAX_BANK_SYNC_TIMEOUT = 30
+_BANK_CONFIG_FALLBACK_STATUSES = {401, 403, 404, 405, 422}
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -148,6 +152,38 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
         return None
     version = data.get("version") or data.get("api_version")
     return str(version) if version else None
+
+
+def _patch_hindsight_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    api_key: str | None = None,
+    timeout: float = _DEFAULT_BANK_SYNC_TIMEOUT,
+) -> int:
+    """PATCH JSON to Hindsight and return the HTTP status code.
+
+    Kept as a narrow seam so mission-sync tests stay network-free. The caller
+    owns fail-open behavior and redacted logging.
+    """
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="PATCH",
+        headers={"Content-Type": "application/json"},
+    )
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            resp.read()
+            return int(getattr(resp, "status", 200))
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
 
 
 def _check_api_supports_update_mode_append(api_url: str,
@@ -599,6 +635,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+        self._bank_sync_timeout = _DEFAULT_BANK_SYNC_TIMEOUT
+        self._bank_sync_thread: threading.Thread | None = None
+        self._daemon_start_thread: threading.Thread | None = None
 
     @property
     def name(self) -> str:
@@ -880,6 +919,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
+            {"key": "bank_sync_timeout", "description": "Best-effort bank metadata sync timeout in seconds", "default": _DEFAULT_BANK_SYNC_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
         ]
 
@@ -1072,6 +1112,147 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._session_id, "append"
         return fallback_document_id, None
 
+    def _bank_mission_payload(self) -> dict[str, str]:
+        """Return syncable bank mission fields, omitting blank values."""
+        payload: dict[str, str] = {}
+        reflect_mission = str(self._bank_mission or "").strip()
+        retain_mission = str(self._bank_retain_mission or "").strip()
+        if reflect_mission:
+            payload["reflect_mission"] = reflect_mission
+        if retain_mission:
+            payload["retain_mission"] = retain_mission
+        return payload
+
+    @staticmethod
+    def _bank_sync_status_ok(status: int) -> bool:
+        return 200 <= int(status) < 300
+
+    def _sync_bank_missions(self) -> None:
+        """Best-effort sync of configured mission text to the live bank.
+
+        Uses the wrapped config endpoint first, then falls back to the bank
+        metadata endpoint. All failures stay fail-open: mission metadata is
+        useful, but memory availability wins.
+        """
+        import urllib.parse
+
+        payload = self._bank_mission_payload()
+        if not payload:
+            return
+
+        api_url = (self._probe_url() or "").rstrip("/")
+        fields = sorted(payload.keys())
+        if not api_url or not self._bank_id:
+            logger.warning(
+                "Hindsight bank mission sync skipped: missing api_url or bank_id "
+                "(mode=%s, bank=%s, fields=%s)",
+                self._mode,
+                self._bank_id or "<empty>",
+                fields,
+            )
+            return
+
+        quoted_bank_id = urllib.parse.quote(self._bank_id, safe="")
+        config_url = f"{api_url}/v1/default/banks/{quoted_bank_id}/config"
+        config_payload = {"updates": payload}
+        try:
+            status = _patch_hindsight_json(
+                config_url,
+                config_payload,
+                api_key=self._api_key,
+                timeout=self._bank_sync_timeout,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Hindsight config bank mission sync failed open "
+                "(bank=%s, fields=%s, error_type=%s)",
+                self._bank_id,
+                fields,
+                type(exc).__name__,
+            )
+            return
+
+        if self._bank_sync_status_ok(status):
+            logger.debug(
+                "Hindsight bank mission sync applied via config endpoint "
+                "(bank=%s, fields=%s)",
+                self._bank_id,
+                fields,
+            )
+            return
+
+        if status not in _BANK_CONFIG_FALLBACK_STATUSES:
+            logger.warning(
+                "Hindsight bank mission sync failed open "
+                "(bank=%s, fields=%s, status=%s)",
+                self._bank_id,
+                fields,
+                status,
+            )
+            return
+
+        logger.debug(
+            "Hindsight config bank mission sync unavailable (status=%s, bank=%s); "
+            "trying bank endpoint fallback",
+            status,
+            self._bank_id,
+        )
+        bank_url = f"{api_url}/v1/default/banks/{quoted_bank_id}"
+        try:
+            fallback_status = _patch_hindsight_json(
+                bank_url,
+                payload,
+                api_key=self._api_key,
+                timeout=self._bank_sync_timeout,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Hindsight bank mission sync failed open "
+                "(bank=%s, fields=%s, error_type=%s)",
+                self._bank_id,
+                fields,
+                type(exc).__name__,
+            )
+            return
+
+        if self._bank_sync_status_ok(fallback_status):
+            logger.debug(
+                "Hindsight bank mission sync applied via bank endpoint "
+                "(bank=%s, fields=%s)",
+                self._bank_id,
+                fields,
+            )
+            return
+
+        logger.warning(
+            "Hindsight bank mission sync failed open "
+            "(bank=%s, fields=%s, status=%s)",
+            self._bank_id,
+            fields,
+            fallback_status,
+        )
+
+    def _start_bank_mission_sync(self) -> None:
+        """Launch optional bank mission sync without blocking provider startup."""
+        if not self._bank_mission_payload():
+            self._bank_sync_thread = None
+            return
+
+        def _run_sync() -> None:
+            try:
+                self._sync_bank_missions()
+            except Exception as exc:
+                logger.warning(
+                    "Hindsight bank mission sync failed open "
+                    "(bank=%s, error_type=%s)",
+                    self._bank_id,
+                    type(exc).__name__,
+                )
+
+        t = threading.Thread(target=_run_sync, daemon=True, name="hindsight-bank-mission-sync")
+        self._bank_sync_thread = t
+        t.start()
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1132,6 +1313,13 @@ class HindsightMemoryProvider(MemoryProvider):
             self._config.get("timeout") if self._config.get("timeout") is not None else os.environ.get("HINDSIGHT_TIMEOUT"),
             _DEFAULT_TIMEOUT,
         )
+        raw_bank_sync_timeout = _parse_int_setting(
+            self._config.get("bank_sync_timeout")
+            if self._config.get("bank_sync_timeout") is not None
+            else os.environ.get("HINDSIGHT_BANK_SYNC_TIMEOUT"),
+            _DEFAULT_BANK_SYNC_TIMEOUT,
+        )
+        self._bank_sync_timeout = max(1, min(raw_bank_sync_timeout, _MAX_BANK_SYNC_TIMEOUT))
         self._idle_timeout = _parse_int_setting(
             self._config.get("idle_timeout") if self._config.get("idle_timeout") is not None else os.environ.get("HINDSIGHT_IDLE_TIMEOUT"),
             _DEFAULT_IDLE_TIMEOUT,
@@ -1275,13 +1463,25 @@ class HindsightMemoryProvider(MemoryProvider):
                     client._ensure_started()
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write("\n=== Daemon started successfully ===\n")
+                    try:
+                        self._sync_bank_missions()
+                    except Exception as sync_exc:
+                        logger.warning(
+                            "Hindsight embedded bank mission sync failed open "
+                            "(bank=%s, error_type=%s)",
+                            self._bank_id,
+                            type(sync_exc).__name__,
+                        )
                 except Exception as e:
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(f"\n=== Daemon startup failed: {e} ===\n")
                         traceback.print_exc(file=f)
 
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
+            self._daemon_start_thread = t
             t.start()
+        else:
+            self._start_bank_mission_sync()
 
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
@@ -1760,6 +1960,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
+        if self._bank_sync_thread and self._bank_sync_thread.is_alive():
+            self._bank_sync_thread.join(timeout=min(float(self._bank_sync_timeout), 5.0))
+        if self._daemon_start_thread and self._daemon_start_thread.is_alive():
+            self._daemon_start_thread.join(timeout=5.0)
         if self._client is not None:
             try:
                 if self._mode == "local_embedded":

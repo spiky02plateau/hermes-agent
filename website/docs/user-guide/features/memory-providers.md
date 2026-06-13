@@ -354,6 +354,10 @@ The setup wizard installs dependencies automatically and only installs what's ne
 |-----|---------|-------------|
 | `mode` | `cloud` | `cloud` or `local` |
 | `bank_id` | `hermes` | Memory bank identifier |
+| `bank_id_template` | — | Optional template for deriving the bank id from session/profile context |
+| `bank_mission` | — | Best-effort syncs to the bank's `reflect_mission` on provider startup |
+| `bank_retain_mission` | — | Best-effort syncs to the bank's `retain_mission` on provider startup |
+| `bank_sync_timeout` | `5` | Timeout in seconds for optional bank metadata sync; memory operations keep working if sync fails |
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `memory_mode` | `hybrid` | `hybrid` (context + tools), `context` (auto-inject only), `tools` (tools only) |
 | `auto_retain` | `true` | Automatically retain conversation turns |
@@ -367,6 +371,8 @@ The setup wizard installs dependencies automatically and only installs what's ne
 | `recall_tags` | — | Tags to filter on recall |
 
 See [plugin README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/hindsight/README.md) for the full configuration reference.
+
+Bank mission sync is best-effort and startup-safe: Hermes uses a compatible wrapped config update when available, falls back to the bank metadata endpoint when needed, and keeps retain/recall/reflect usable if the API rejects or times out. If the API is reachable, startup may update the configured bank metadata; use a disposable bank/profile for smoke tests unless you intend to mutate that bank.
 
 ---
 

@@ -354,6 +354,10 @@ echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
 |-----|---------|-------------|
 | `mode` | `cloud` | `cloud` 或 `local` |
 | `bank_id` | `hermes` | 记忆库标识符 |
+| `bank_id_template` | — | 可选模板，用 session/profile 上下文派生 bank id |
+| `bank_mission` | — | 在提供者启动时尽力同步到 bank 的 `reflect_mission` |
+| `bank_retain_mission` | — | 在提供者启动时尽力同步到 bank 的 `retain_mission` |
+| `bank_sync_timeout` | `5` | 可选 bank 元数据同步超时时间（秒）；同步失败时记忆操作仍可用 |
 | `recall_budget` | `mid` | 召回彻底程度：`low` / `mid` / `high` |
 | `memory_mode` | `hybrid` | `hybrid`（上下文 + 工具）、`context`（仅自动注入）、`tools`（仅工具） |
 | `auto_retain` | `true` | 自动保留对话轮次 |
@@ -367,6 +371,8 @@ echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
 | `recall_tags` | — | 召回时用于过滤的标签 |
 
 完整配置参考参见[插件 README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/hindsight/README.md)。
+
+Bank mission 同步是尽力而为且启动安全的：Hermes 会优先使用兼容的 wrapped config update，必要时回退到 bank metadata endpoint；如果 API 拒绝请求或超时，retain/recall/reflect 仍保持可用。如果 API 可达，启动过程可能更新已配置 bank 的元数据；除非你确实想修改该 bank，否则请用一次性的 bank/profile 做 smoke test。
 
 ---
 
