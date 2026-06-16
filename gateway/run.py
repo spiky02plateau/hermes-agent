@@ -8724,9 +8724,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
+            # Off by default (display.runtime_footer.enabled=false). Streaming
+            # delivery sets this as a stream-consumer final suffix before finish();
+            # non-streaming replies append it here.
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
@@ -8998,21 +8998,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
-                    try:
-                        _foot_adapter = self.adapters.get(source.platform)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
-                                source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
-                    except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
+                # Runtime footer is appended during stream finalization by
+                # GatewayStreamConsumer.set_final_suffix(). Footer-only trailing
+                # sends are intentionally forbidden; a rare missing footer is
+                # better than a recurring standalone metadata message.
                 return None
 
             return response
@@ -14596,10 +14585,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
-            # Signal the stream consumer that the agent is done
-            if _stream_consumer is not None:
-                _stream_consumer.finish()
-            
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
 
@@ -14615,6 +14600,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+
+            if _stream_consumer is not None:
+                _footer_suffix = ""
+                if final_response:
+                    try:
+                        from gateway.runtime_footer import build_footer_line as _bfl
+                        _footer_suffix = _bfl(
+                            user_config=_load_gateway_config(),
+                            platform_key=_platform_config_key(source.platform),
+                            model=_resolved_model,
+                            context_tokens=_last_prompt_toks,
+                            context_length=_context_length or None,
+                            cwd=os.environ.get("TERMINAL_CWD", ""),
+                        )
+                    except Exception as _footer_err:
+                        logger.debug("runtime_footer stream suffix build failed: %s", _footer_err)
+                _stream_consumer.set_final_suffix(_footer_suffix)
+                _stream_consumer.finish()
 
             # Sync session_id immediately after run_conversation(). Compression
             # can rotate before a follow-up model call fails; the failure return
