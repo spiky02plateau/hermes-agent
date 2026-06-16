@@ -53,6 +53,15 @@ def _model_short(model: Optional[str]) -> str:
     return model.rsplit("/", 1)[-1]
 
 
+def _tokens_short(tokens: int) -> str:
+    """Format token counts compactly for footer display."""
+    if tokens >= 1_000_000:
+        return f"{round(tokens / 1_000_000)}M"
+    if tokens >= 1_000:
+        return f"{round(tokens / 1_000)}K"
+    return str(tokens)
+
+
 def resolve_footer_config(
     user_config: dict[str, Any] | None,
     platform_key: str | None = None,
@@ -111,6 +120,9 @@ def format_runtime_footer(
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field == "context_tokens":
+            if context_length and context_length > 0 and context_tokens >= 0:
+                parts.append(f"{_tokens_short(context_tokens)}/{_tokens_short(context_length)}")
         elif field == "cwd":
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:

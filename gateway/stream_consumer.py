@@ -196,6 +196,9 @@ class GatewayStreamConsumer:
         # first failure we permanently disable drafts for the remainder of
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
+        # Text appended exactly once to the true turn-final streamed message
+        # (runtime footer). Segment breaks/tool-boundary finalization never use it.
+        self._final_suffix = ""
 
     def _metadata_for_send(
         self,
@@ -332,6 +335,22 @@ class GatewayStreamConsumer:
     def finish(self) -> None:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
+
+    def set_final_suffix(self, text: str | None) -> None:
+        """Set text appended to the true turn-final streamed message."""
+        self._final_suffix = (text or "").strip()
+
+    def _with_final_suffix(self, text: str) -> str:
+        """Return *text* with the final suffix appended exactly once."""
+        suffix = self._final_suffix
+        if not suffix:
+            return text
+        base = text.rstrip()
+        if base.endswith(suffix):
+            return text
+        if not base:
+            return suffix
+        return f"{base}\n\n{suffix}"
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -498,6 +517,8 @@ class GatewayStreamConsumer:
                 # tag is not lost.
                 if got_done:
                     self._flush_think_buffer()
+                    if self._accumulated:
+                        self._accumulated = self._with_final_suffix(self._accumulated)
 
                 # Decide whether to flush an edit
                 now = time.monotonic()

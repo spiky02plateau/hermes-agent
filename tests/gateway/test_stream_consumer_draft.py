@@ -507,3 +507,75 @@ class TestRichAwareOverflow:
         assert consumer._message_id == "final1"
         assert consumer._preview_message_ids == set()
         assert consumer.final_response_sent is True
+
+
+class TestFinalSuffixDelivery:
+    @pytest.mark.asyncio
+    async def test_stream_final_send_includes_footer_suffix_once(self):
+        adapter = _make_draft_capable_adapter()
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer.set_final_suffix("gpt-5.5 · 12K/200K · 6%")
+
+        consumer.on_delta("Hello")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        sent_content = adapter.send.call_args.kwargs.get("content")
+        assert sent_content == "Hello\n\ngpt-5.5 · 12K/200K · 6%"
+        assert sent_content.count("gpt-5.5 · 12K/200K · 6%") == 1
+
+    @pytest.mark.asyncio
+    async def test_segment_break_does_not_receive_footer_suffix(self):
+        adapter = _make_draft_capable_adapter()
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="",
+        )
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer.set_final_suffix("footer")
+
+        consumer.on_delta("Pre-tool")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        await asyncio.sleep(0.05)
+        consumer.on_delta("Final answer")
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        sent_contents = [call.kwargs.get("content") for call in adapter.send.call_args_list]
+        assert "Pre-tool\n\nfooter" not in sent_contents
+        assert sent_contents[-1] == "Final answer\n\nfooter"
+
+    def test_apply_final_suffix_is_idempotent(self):
+        consumer = GatewayStreamConsumer(
+            _make_draft_capable_adapter(), "12345", StreamConsumerConfig()
+        )
+        consumer.set_final_suffix("footer")
+        assert consumer._with_final_suffix("body\n\nfooter") == "body\n\nfooter"
+
+    @pytest.mark.asyncio
+    async def test_fallback_final_send_includes_footer_suffix(self):
+        adapter = _make_draft_capable_adapter()
+        cfg = StreamConsumerConfig(
+            transport="edit", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=5, cursor="", buffer_only=True,
+        )
+        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer.set_final_suffix("footer")
+        consumer._fallback_final_send = True
+
+        consumer.on_delta("Fallback body")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await task
+
+        assert adapter.send.call_args_list[-1].kwargs.get("content") == "Fallback body\n\nfooter"
