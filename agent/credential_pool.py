@@ -86,13 +86,14 @@ _TERMINAL_AUTH_REASONS = frozenset({
 # the cleanup.  They remain in the pool marked DEAD until an explicit re-auth
 # write-side sync (``_save_codex_tokens`` etc.) clears the status.
 DEAD_MANUAL_PRUNE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
-_CODEX_DEVICE_CODE_SOURCES = frozenset({"device_code", "manual:device_code"})
 
 AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
 
 SOURCE_MANUAL = "manual"
+SOURCE_DEVICE_CODE = "device_code"
 SOURCE_MANUAL_DEVICE_CODE = f"{SOURCE_MANUAL}:device_code"
+_CODEX_DEVICE_CODE_SOURCES = frozenset({SOURCE_DEVICE_CODE, SOURCE_MANUAL_DEVICE_CODE})
 
 STRATEGY_FILL_FIRST = "fill_first"
 STRATEGY_ROUND_ROBIN = "round_robin"
@@ -1072,9 +1073,9 @@ class CredentialPool:
                     return updated
                 # Terminal error: auth.json has no newer tokens — the stored
                 # refresh_token is dead.  Clear it from auth.json so the next
-                # session does not re-seed the same revoked credentials, and
-                # remove all singleton-seeded (device_code) entries from the
-                # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
+                # session does not re-seed revoked credentials, and quarantine
+                # both legacy singleton device_code and manual device-code pool
+                # entries.  Mirrors the xAI and Nous quarantine paths.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"

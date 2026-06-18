@@ -100,25 +100,63 @@ def test_codex_diagnostic_is_sanitized_and_marks_profile_divergence(tmp_path, mo
         [{"id": "primary", "label": "openai-codex-oauth-1", "source": "manual:device_code", "access_token": fresh}],
     )
 
-    def fake_runtime(home):
-        return {
-            "source": "credential_pool",
-            "credential_pool": str(home).endswith("ops"),
-            "provider": "openai-codex",
-            "api_key_present": True,
-        }
-
-    monkeypatch.setattr("hermes_cli.auth_commands._runtime_snapshot_for_home", fake_runtime)
-
     auth_diagnose_codex_command(SimpleNamespace(homes=[str(default_home), str(ops_home)]))
 
     out = capsys.readouterr().out
     assert expired not in out
     assert fresh not in out
     report = json.loads(out)
-    assert report[0]["raw_pool_fallback_unhealthy"] is True
+    assert report[0]["raw_pool_fallback_unhealthy"] is False
+    assert report[0]["runtime"]["source"] == "unavailable"
     assert report[0]["entries"][0]["expiry"]["expired"] is True
     assert report[0]["entries"][0]["next_action"] == "hermes auth reauth openai-codex openai-codex-oauth-1"
     assert report[0]["entries"][1]["last_error_code"] == "refresh_token_reused"
     assert report[1]["raw_pool_fallback_unhealthy"] is False
+    assert report[1]["runtime"]["source"] == "credential_pool"
     assert report[1]["entries"][0]["expiry"]["expired"] is False
+
+
+def test_codex_reauth_uses_fresh_codex_cli_import_before_device_flow(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    _write_auth(
+        home,
+        [{
+            "id": "primary",
+            "label": "openai-codex-oauth-1",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+        }],
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "hermes_cli.auth._import_codex_cli_tokens",
+        lambda: {"access_token": "cli-access", "refresh_token": "cli-refresh", "last_refresh": "2026-06-17T10:00:00Z"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda: (_ for _ in ()).throw(AssertionError("device flow should not run when CLI import is fresh")),
+    )
+
+    auth_reauth_command(SimpleNamespace(provider="openai-codex", target="openai-codex-oauth-1"))
+
+    entries = json.loads((home / "auth.json").read_text())["credential_pool"]["openai-codex"]
+    assert entries[0]["access_token"] == "cli-access"
+    assert entries[0]["refresh_token"] == "cli-refresh"
+
+
+def test_codex_diagnostic_treats_opaque_pool_token_as_usable(tmp_path, capsys):
+    home = tmp_path / "hermes"
+    _write_auth(
+        home,
+        [{"id": "primary", "label": "openai-codex-oauth-1", "source": "manual:device_code", "access_token": "opaque-token"}],
+    )
+
+    auth_diagnose_codex_command(SimpleNamespace(homes=[str(home)]))
+
+    report = json.loads(capsys.readouterr().out)
+    assert report[0]["runtime"]["source"] == "credential_pool"
+    assert report[0]["runtime"]["credential_pool"] is True
+    assert report[0]["entries"][0]["expiry"] == {"shape": "opaque", "healthy": True}
+    assert report[0]["entries"][0]["next_action"] == "ok"

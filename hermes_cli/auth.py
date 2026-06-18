@@ -3984,7 +3984,7 @@ def _pool_codex_access_token() -> str:
                 exp = claims.get("exp")
                 if not isinstance(exp, (int, float)):
                     return False
-                if _codex_access_token_is_expiring(token, 0):
+                if exp <= time.time():
                     return False
             return True
 
