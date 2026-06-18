@@ -50,6 +50,12 @@ def _jwt_with_exp(exp_epoch: int) -> str:
     return f"h.{encoded}.s"
 
 
+def _jwt_exp_claim(token: str) -> int:
+    payload = token.split(".")[1]
+    payload += "=" * ((4 - len(payload) % 4) % 4)
+    return int(json.loads(base64.urlsafe_b64decode(payload))["exp"])
+
+
 def test_read_codex_tokens_success(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home)
@@ -204,6 +210,95 @@ def test_resolve_codex_runtime_credentials_pool_fallback_no_usable_entry(tmp_pat
         "credential_pool": {
             "openai-codex": [
                 {"source": "device_code", "access_token": ""},  # empty
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing"
+
+
+def test_resolve_codex_runtime_credentials_pool_fallback_skips_expired_jwt(tmp_path, monkeypatch):
+    now = int(time.time())
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {"source": "device_code", "access_token": _jwt_with_exp(now - 60)},
+                {"source": "device_code", "access_token": _jwt_with_exp(now + 3600)},
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert _jwt_exp_claim(resolved["api_key"]) == now + 3600
+
+
+def test_resolve_codex_runtime_credentials_pool_fallback_rejects_only_explicitly_unusable_tokens(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    future_reset = time.time() + 3600
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {"source": "device_code", "access_token": ""},
+                {"source": "device_code", "access_token": _jwt_with_exp(int(time.time()) - 60)},
+                {"source": "device_code", "access_token": "h.not-base64.s"},
+                {"source": "device_code", "access_token": "cooldown-token", "last_error_reset_at": future_reset},
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing"
+
+
+def test_resolve_codex_runtime_credentials_pool_fallback_preserves_opaque_token(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {"source": "device_code", "access_token": "opaque-token"},
+            ],
+        },
+    }
+    (hermes_home / "auth.json").write_text(json.dumps(auth_store))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == "opaque-token"
+    assert resolved["source"] == "credential_pool"
+
+
+def test_resolve_codex_runtime_credentials_pool_fallback_rejects_current_boundary_expiry(tmp_path, monkeypatch):
+    now = 1_800_000_000
+    monkeypatch.setattr("hermes_cli.auth.time.time", lambda: now)
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openai-codex": [
+                {"source": "device_code", "access_token": _jwt_with_exp(now)},
             ],
         },
     }

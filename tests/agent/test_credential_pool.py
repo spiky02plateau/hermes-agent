@@ -2924,13 +2924,23 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert selected is not None
     assert selected.source == "device_code"
 
-    # Add a manual API-key entry that must survive the quarantine.
+    # Add a manual device-code entry that shares the terminal refresh risk.
+    pool.add_entry(PooledCredential.from_dict("openai-codex", {
+        "id": "auth-add-device-code",
+        "source": "manual:device_code",
+        "auth_type": "oauth",
+        "access_token": "manual-device-code-access",
+        "refresh_token": "manual-device-code-refresh",
+    }))
+
+    # Add a manual API-key entry that must survive the quarantine unchanged.
     pool.add_entry(PooledCredential.from_dict("openai-codex", {
         "id": "manual-key",
-        "source": "manual",
+        "source": "manual:api_key",
         "auth_type": "api_key",
         "access_token": "manual-codex-key",
     }))
+    manual_key_before = next(entry for entry in pool.entries() if entry.id == "manual-key").to_dict()
 
     refresh_calls = {"count": 0}
 
@@ -2947,8 +2957,9 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
 
     assert pool.try_refresh_current() is None
 
-    # Only the manual entry survives.
+    # Only the unrelated manual API-key entry survives, unchanged.
     assert [entry.id for entry in pool.entries()] == ["manual-key"]
+    assert pool.entries()[0].to_dict() == manual_key_before
 
     # Auth.json tokens must be cleared.
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
@@ -2959,8 +2970,12 @@ def test_codex_oauth_terminal_refresh_clears_auth_json_and_removes_pool_entries(
     assert codex_state["last_auth_error"]["code"] == "codex_refresh_failed"
     assert codex_state["last_auth_error"]["relogin_required"] is True
 
-    # Persisted pool must also have only the manual entry.
-    assert [entry["id"] for entry in auth_payload["credential_pool"]["openai-codex"]] == ["manual-key"]
+    # Persisted pool must also have only the unchanged manual API-key entry.
+    persisted_pool = auth_payload["credential_pool"]["openai-codex"]
+    assert [entry["id"] for entry in persisted_pool] == ["manual-key"]
+    assert persisted_pool[0]["id"] == manual_key_before["id"]
+    assert persisted_pool[0]["source"] == manual_key_before["source"]
+    assert persisted_pool[0]["auth_type"] == manual_key_before["auth_type"]
 
     # A second try_refresh_current must not call refresh_codex_oauth_pure again.
     assert pool.try_refresh_current() is None
@@ -2974,12 +2989,20 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
 
     _write_auth_store(tmp_path, _codex_auth_store("old-access-token", "old-refresh-token"))
 
-    from agent.credential_pool import load_pool
+    from agent.credential_pool import PooledCredential, load_pool
     import hermes_cli.auth as auth_mod
     from hermes_cli.auth import AuthError
 
     pool = load_pool("openai-codex")
     assert pool.select() is not None
+    pool.add_entry(PooledCredential.from_dict("openai-codex", {
+        "id": "auth-add-device-code",
+        "source": "manual:device_code",
+        "auth_type": "oauth",
+        "access_token": "manual-device-code-access",
+        "refresh_token": "manual-device-code-refresh",
+    }))
+    entry_ids_before = [entry.id for entry in pool.entries()]
 
     def _transient_failure(*_args, **_kwargs):
         raise AuthError(
@@ -2993,8 +3016,9 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
 
     pool.try_refresh_current()
 
-    # Tokens must NOT be cleared from auth.json.
+    # Tokens and pool entries must NOT be cleared from auth.json.
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     tokens = auth_payload["providers"]["openai-codex"].get("tokens", {})
     assert tokens.get("access_token") == "old-access-token"
     assert tokens.get("refresh_token") == "old-refresh-token"
+    assert [entry.id for entry in pool.entries()] == entry_ids_before

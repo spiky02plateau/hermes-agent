@@ -86,6 +86,7 @@ _TERMINAL_AUTH_REASONS = frozenset({
 # the cleanup.  They remain in the pool marked DEAD until an explicit re-auth
 # write-side sync (``_save_codex_tokens`` etc.) clears the status.
 DEAD_MANUAL_PRUNE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+_CODEX_DEVICE_CODE_SOURCES = frozenset({"device_code", "manual:device_code"})
 
 AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
@@ -1107,7 +1108,7 @@ class CredentialPool:
                         )
                     self._entries = [
                         item for item in self._entries
-                        if item.source != "device_code"
+                        if item.source not in _CODEX_DEVICE_CODE_SOURCES
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None

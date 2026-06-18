@@ -3971,10 +3971,21 @@ def _pool_codex_access_token() -> str:
             token = entry.get("access_token")
             if not isinstance(token, str) or not token.strip():
                 return False
+            token = token.strip()
             # Skip entries currently in an exhaustion cooldown window.
             reset_at = entry.get("last_error_reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 return False
+            # Preserve compatibility for clearly opaque non-JWT fallback tokens,
+            # but do not replay JWT-shaped values whose expiry is expired,
+            # malformed, or missing.
+            if token.count(".") == 2:
+                claims = _decode_jwt_claims(token)
+                exp = claims.get("exp")
+                if not isinstance(exp, (int, float)):
+                    return False
+                if _codex_access_token_is_expiring(token, 0):
+                    return False
             return True
 
         for entry in entries:

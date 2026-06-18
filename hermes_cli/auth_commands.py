@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import math
+import os
 import sys
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 import uuid
 
@@ -434,6 +441,86 @@ def auth_add_command(args) -> None:
     raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")
 
 
+def _clear_provider_auth_error(provider: str) -> None:
+    """Clear stale provider-level auth errors after an explicit credential repair."""
+    try:
+        with auth_mod._auth_store_lock():
+            auth_store = auth_mod._load_auth_store()
+            providers = auth_store.get("providers")
+            if not isinstance(providers, dict):
+                return
+            state = providers.get(provider)
+            if not isinstance(state, dict) or "last_auth_error" not in state:
+                return
+            state.pop("last_auth_error", None)
+            auth_mod._save_auth_store(auth_store)
+    except Exception:
+        # Reauth succeeded; failing to clear a diagnostic marker should not
+        # discard the fresh label-scoped credential.
+        pass
+
+
+def _replace_pool_entry(pool, old: PooledCredential, new: PooledCredential) -> PooledCredential:
+    """Replace a credential entry in place while preserving id/label/priority."""
+    pool._replace_entry(old, new)  # private but already the canonical in-place swapper
+    pool._persist()
+    return new
+
+
+def auth_reauth_command(args) -> None:
+    """Repair an existing credential label without creating a duplicate entry."""
+    provider = _normalize_provider(getattr(args, "provider", ""))
+    target = str(getattr(args, "target", "") or "").strip()
+    if provider != "openai-codex":
+        raise SystemExit("Exact-label reauth is currently supported for openai-codex only.")
+    if not target:
+        raise SystemExit("Existing credential label is required. Example: hermes auth reauth openai-codex openai-codex-oauth-1")
+
+    pool = load_pool(provider)
+    index, existing, error = pool.resolve_target(target)
+    if existing is None or index is None:
+        raise SystemExit(f"{error} Use `hermes auth add {provider}` to add a new credential.")
+    if existing.label.strip().lower() != target.lower():
+        raise SystemExit("Reauth requires the exact credential label, not an index or id. Use `hermes auth list openai-codex` first.")
+
+    # Prefer Codex CLI import when it already has a fresh token pair; otherwise
+    # fall through to the device-code flow. Both paths feed the same exact-label
+    # replacement logic below.
+    tokens = auth_mod._import_codex_cli_tokens()
+    source_detail = "Codex CLI import"
+    base_url = existing.base_url or auth_mod.DEFAULT_CODEX_BASE_URL
+    last_refresh = None
+    if not tokens:
+        creds = auth_mod._codex_device_code_login()
+        tokens = creds.get("tokens") or {}
+        base_url = creds.get("base_url") or base_url
+        last_refresh = creds.get("last_refresh")
+        source_detail = "device-code login"
+
+    access_token = str(tokens.get("access_token") or "").strip()
+    refresh_token = str(tokens.get("refresh_token") or "").strip()
+    if not access_token or not refresh_token:
+        raise SystemExit("Codex reauth did not return both access_token and refresh_token; auth.json was not changed.")
+
+    updated = replace(
+        existing,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        base_url=base_url,
+        last_refresh=last_refresh or tokens.get("last_refresh") or existing.last_refresh,
+        last_status=None,
+        last_status_at=None,
+        last_error_code=None,
+        last_error_reason=None,
+        last_error_message=None,
+        last_error_reset_at=None,
+    )
+    _replace_pool_entry(pool, existing, updated)
+    _clear_provider_auth_error(provider)
+    auth_mod.mark_provider_active_if_unset(provider)
+    print(f'Reauthenticated {provider} credential "{updated.label}" via {source_detail}; entry id preserved: {updated.id}')
+
+
 def auth_list_command(args) -> None:
     provider_filter = _normalize_provider(getattr(args, "provider", "") or "")
     if provider_filter:
@@ -504,6 +591,162 @@ def auth_reset_command(args) -> None:
     pool = load_pool(provider)
     count = pool.reset_statuses()
     print(f"Reset status on {count} {provider} credentials")
+
+
+def _short_fingerprint(token: str) -> str:
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
+
+
+def _jwt_expiry_snapshot(token: str) -> dict:
+    token = str(token or "").strip()
+    if not token:
+        return {"shape": "missing"}
+    if token.count(".") != 2:
+        return {"shape": "opaque"}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except Exception:
+        return {"shape": "jwt_malformed", "healthy": False}
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return {"shape": "jwt", "has_exp": False, "healthy": False}
+    expired = exp <= time.time()
+    return {
+        "shape": "jwt",
+        "has_exp": True,
+        "exp": datetime.fromtimestamp(exp, timezone.utc).isoformat(),
+        "expired": expired,
+        "healthy": not expired,
+    }
+
+
+def _load_auth_json(home: Path) -> dict:
+    try:
+        return json.loads((home / "auth.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        return {"_error": f"{type(exc).__name__}: {exc}"}
+
+
+def _runtime_snapshot_for_home(home: Path) -> dict:
+    """Best-effort read-only Codex runtime snapshot.
+
+    Do not call resolve_runtime_provider() here: provider resolution can refresh,
+    prune, or rewrite credential-pool state. Diagnostics must be paste-safe and
+    read-only.
+    """
+    auth_store = _load_auth_json(home)
+    providers = auth_store.get("providers") if isinstance(auth_store, dict) else {}
+    codex_state = (providers or {}).get("openai-codex") if isinstance(providers, dict) else {}
+    tokens = (codex_state or {}).get("tokens") if isinstance(codex_state, dict) else {}
+    access_token = str((tokens or {}).get("access_token") or "")
+    singleton_expiry = _jwt_expiry_snapshot(access_token)
+    pool_rows = _codex_entry_rows(home)
+    fresh_pool = any(row.get("expiry", {}).get("healthy") is True for row in pool_rows if row.get("label") != "<provider-state>")
+    has_singleton = bool(access_token)
+    singleton_healthy = singleton_expiry.get("healthy") is True or singleton_expiry.get("shape") == "opaque"
+    if has_singleton and singleton_healthy:
+        source = "hermes-auth-store"
+    elif fresh_pool:
+        source = "credential_pool"
+    else:
+        source = "unavailable"
+    return {
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+        "source": source,
+        "credential_pool": fresh_pool,
+        "api_key_present": bool((has_singleton and singleton_healthy) or fresh_pool),
+        "read_only": True,
+    }
+
+
+def _codex_entry_rows(home: Path) -> list[dict]:
+    auth_store = _load_auth_json(home)
+    pool = (auth_store.get("credential_pool") or {}).get("openai-codex") if isinstance(auth_store, dict) else None
+    if isinstance(pool, list):
+        entries = pool
+    elif isinstance(pool, dict):
+        entries = pool.get("entries") or []
+    else:
+        entries = []
+    providers = auth_store.get("providers") if isinstance(auth_store, dict) else {}
+    codex_state = (providers or {}).get("openai-codex") if isinstance(providers, dict) else {}
+    singleton_error = (codex_state or {}).get("last_auth_error") if isinstance(codex_state, dict) else {}
+    rows = []
+    seen_labels = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "")
+        seen_labels[label.lower()] = seen_labels.get(label.lower(), 0) + 1
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        token = str(entry.get("access_token") or "")
+        expiry = _jwt_expiry_snapshot(token)
+        last_code = entry.get("last_error_code")
+        last_reason = entry.get("last_error_reason")
+        label = str(entry.get("label") or "")
+        duplicate = seen_labels.get(label.lower(), 0) > 1 if label else False
+        action = "ok"
+        if duplicate:
+            action = "remove duplicate labels or target by id before reauth"
+        elif expiry.get("expired") or expiry.get("healthy") is False or last_reason == "refresh_token_reused":
+            action = f"hermes auth reauth openai-codex {label}" if label else "hermes auth add openai-codex"
+        rows.append({
+            "home": str(home),
+            "label": label,
+            "id": entry.get("id"),
+            "source": entry.get("source"),
+            "status": entry.get("last_status"),
+            "access_fp": _short_fingerprint(token),
+            "expiry": expiry,
+            "last_error_code": last_code,
+            "last_error_reason": last_reason,
+            "duplicate_label": duplicate,
+            "next_action": action,
+        })
+    if singleton_error:
+        rows.append({
+            "home": str(home),
+            "label": "<provider-state>",
+            "source": "providers.openai-codex",
+            "status": "error",
+            "access_fp": "",
+            "expiry": _jwt_expiry_snapshot(((codex_state or {}).get("tokens") or {}).get("access_token", "")),
+            "last_error_code": singleton_error.get("code"),
+            "last_error_reason": singleton_error.get("reason"),
+            "duplicate_label": False,
+            "next_action": "import fresh Codex CLI tokens or exact-label reauth",
+        })
+    return rows
+
+
+def auth_diagnose_codex_command(args) -> None:
+    homes = getattr(args, "homes", None) or []
+    if not homes:
+        homes = [os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")]
+    report = []
+    for raw_home in homes:
+        home = Path(raw_home).expanduser().resolve()
+        runtime = _runtime_snapshot_for_home(home)
+        rows = _codex_entry_rows(home)
+        raw_fallback = runtime.get("source") == "credential_pool" and not runtime.get("credential_pool")
+        report.append({
+            "home": str(home),
+            "auth_json_exists": (home / "auth.json").exists(),
+            "runtime": runtime,
+            "raw_pool_fallback_unhealthy": raw_fallback,
+            "entries": rows,
+        })
+    print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def auth_status_command(args) -> None:
@@ -789,8 +1032,14 @@ def auth_command(args) -> None:
     if action == "reset":
         auth_reset_command(args)
         return
+    if action == "reauth":
+        auth_reauth_command(args)
+        return
     if action == "status":
         auth_status_command(args)
+        return
+    if action == "diagnose-codex":
+        auth_diagnose_codex_command(args)
         return
     if action == "logout":
         auth_logout_command(args)

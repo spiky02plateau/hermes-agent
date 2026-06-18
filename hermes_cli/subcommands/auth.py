@@ -73,10 +73,24 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "reset", help="Clear exhaustion status for all credentials for a provider"
     )
     auth_reset.add_argument("provider", help="Provider id")
+    auth_reauth = auth_subparsers.add_parser(
+        "reauth", help="Reauthenticate an existing pooled credential by exact label"
+    )
+    auth_reauth.add_argument("provider", help="Provider id")
+    auth_reauth.add_argument("target", help="Exact credential label to repair")
     auth_status = auth_subparsers.add_parser(
         "status", help="Show auth status for a provider"
     )
     auth_status.add_argument("provider", help="Provider id")
+    auth_diag = auth_subparsers.add_parser(
+        "diagnose-codex", help="Read-only sanitized Codex auth diagnostics for one or more profile homes"
+    )
+    auth_diag.add_argument(
+        "--home",
+        action="append",
+        dest="homes",
+        help="Profile home to inspect (repeatable). Defaults to current HERMES_HOME/default home.",
+    )
     auth_logout = auth_subparsers.add_parser(
         "logout", help="Log out a provider and clear stored auth state"
     )
