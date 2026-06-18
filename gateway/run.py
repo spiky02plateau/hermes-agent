@@ -9175,20 +9175,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # delivery sets this as a stream-consumer final suffix before finish();
             # non-streaming replies append it here.
             _footer_line = ""
-            try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
-                    platform_key=_platform_config_key(source.platform),
-                    model=agent_result.get("model"),
-                    context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
-                    context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
-                )
-            except Exception as _footer_err:
-                logger.debug("runtime_footer build failed: %s", _footer_err)
-                _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
+            _should_append_footer = (
+                response
+                and not agent_result.get("already_sent")
+                and not _intentional_silence
+            )
+            if _should_append_footer:
+                try:
+                    from gateway.runtime_footer import build_footer_line as _bfl
+                    _footer_line = _bfl(
+                        user_config=_load_gateway_config(),
+                        platform_key=_platform_config_key(source.platform),
+                        model=agent_result.get("model"),
+                        context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                        context_length=agent_result.get("context_length") or None,
+                        cwd=os.environ.get("TERMINAL_CWD", ""),
+                    )
+                except Exception as _footer_err:
+                    logger.debug("runtime_footer build failed: %s", _footer_err)
+                    _footer_line = ""
+            if _footer_line:
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook

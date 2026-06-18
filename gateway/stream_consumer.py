@@ -196,8 +196,8 @@ class GatewayStreamConsumer:
         # first failure we permanently disable drafts for the remainder of
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
-        # Text appended exactly once to the true turn-final streamed message
-        # (runtime footer). Segment breaks/tool-boundary finalization never use it.
+        # Optional suffix appended exactly once to the true turn-final streamed
+        # message. Segment breaks/tool-boundary finalization never use it.
         self._final_suffix = ""
 
     def _metadata_for_send(

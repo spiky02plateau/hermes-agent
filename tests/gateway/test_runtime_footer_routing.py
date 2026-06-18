@@ -30,7 +30,7 @@ def test_streaming_already_sent_branch_never_sends_footer_only_message():
 
     assert "_footer_line" not in branch
     assert "_foot_adapter" not in branch
-    assert "Footer-only trailing" in branch
+    assert ".send(" not in branch
     assert "return None" in branch
 
 
