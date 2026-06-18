@@ -106,16 +106,21 @@ async def test_rich_happy_path_sends_raw_markdown():
 
 
 @pytest.mark.asyncio
-async def test_legacy_rich_messages_config_is_ignored():
+async def test_rich_messages_config_false_uses_legacy_markdown_path():
     adapter = _make_adapter(extra={"rich_messages": False})
 
     result = await adapter.send("12345", RICH_CONTENT)
 
     assert result.success is True
-    # The legacy toggle was removed; stale config entries must not disable the
-    # rich path.
-    adapter._bot.do_api_request.assert_awaited_once()
-    adapter._bot.send_message.assert_not_called()
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_awaited()
+
+
+def test_rich_messages_config_false_disables_fresh_final_and_overflow_cap():
+    adapter = _make_adapter(extra={"rich_messages": False})
+
+    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is False
+    assert adapter.streaming_overflow_limit() is None
 
 
 @pytest.mark.asyncio
@@ -441,9 +446,9 @@ def test_prefers_fresh_final_streaming_when_rich_enabled():
     assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is True
 
 
-def test_prefers_fresh_final_streaming_ignores_legacy_toggle():
+def test_prefers_fresh_final_streaming_honors_rich_messages_false():
     adapter = _make_adapter(extra={"rich_messages": False})
-    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is True
+    assert adapter.prefers_fresh_final_streaming(RICH_CONTENT) is False
 
 
 # ----------------------------------------------------------------------
@@ -456,9 +461,9 @@ def test_streaming_overflow_limit_is_rich_cap_when_enabled():
     assert adapter.streaming_overflow_limit() == TelegramAdapter.RICH_MESSAGE_MAX_CHARS
 
 
-def test_streaming_overflow_limit_ignores_legacy_toggle():
+def test_streaming_overflow_limit_none_when_rich_messages_false():
     adapter = _make_adapter(extra={"rich_messages": False})
-    assert adapter.streaming_overflow_limit() == TelegramAdapter.RICH_MESSAGE_MAX_CHARS
+    assert adapter.streaming_overflow_limit() is None
 
 
 def test_streaming_overflow_limit_none_when_rich_latched_off():

@@ -760,7 +760,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # --- Telegram: special handling for media attachments ---
     if platform == Platform.TELEGRAM:
         last_result = None
-        disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        extra = getattr(pconfig, "extra", {}) or {}
+        disable_link_previews = bool(extra.get("disable_link_previews"))
+        rich_messages = extra.get("rich_messages", True)
+        if isinstance(rich_messages, str):
+            rich_messages_enabled = rich_messages.strip().lower() not in {"false", "0", "no", "off"}
+        else:
+            rich_messages_enabled = bool(rich_messages)
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _send_telegram(
@@ -770,6 +776,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else [],
                 thread_id=thread_id,
                 disable_link_previews=disable_link_previews,
+                rich_messages_enabled=rich_messages_enabled,
                 force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):
@@ -943,7 +950,7 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, rich_messages_enabled=True, force_document=False):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1031,6 +1038,31 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
         last_msg = None
         warnings = []
+
+        # Bot API 10.1: try sendRichMessage first for native rich rendering
+        # (tables, task lists, collapsibles, headings, etc.) before falling
+        # back to MarkdownV2. Only for markdown content (not HTML), text-only
+        # messages (no media), and within the 32K rich character limit.
+        if rich_messages_enabled and not _has_html and not media_files and formatted.strip() and len(message) <= 32768:
+            try:
+                rich_payload = {
+                    "chat_id": int_chat_id,
+                    "rich_message": {"markdown": message},
+                }
+                rich_payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
+                if disable_link_previews:
+                    rich_payload["link_preview_options"] = {"is_disabled": True}
+                rich_msg = await bot.do_api_request(
+                    "sendRichMessage", api_kwargs=rich_payload
+                )
+                last_msg = rich_msg
+                # Rich send succeeded — skip the MarkdownV2 text path.
+                formatted = ""
+            except Exception as rich_error:
+                logger.debug(
+                    "sendRichMessage failed (%s), falling back to MarkdownV2",
+                    _sanitize_error_text(rich_error),
+                )
 
         if formatted.strip():
             try:
