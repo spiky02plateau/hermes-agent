@@ -34,6 +34,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
+    TELEGRAM_MARKDOWN_V2_HINT,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
@@ -43,6 +44,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
+from hermes_cli.config import load_config
 
 
 def _ra():
@@ -58,6 +60,50 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _get_nested_config_bool(config: Dict[str, Any], paths: List[tuple[str, ...]]) -> Optional[bool]:
+    """Return the first explicit boolean-ish config value found at any path."""
+    for path in paths:
+        cursor: Any = config
+        for key in path:
+            if not isinstance(cursor, dict) or key not in cursor:
+                cursor = None
+                break
+            cursor = cursor[key]
+        if cursor is None:
+            continue
+        if isinstance(cursor, bool):
+            return cursor
+        if isinstance(cursor, str):
+            lowered = cursor.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+    return None
+
+
+def _platform_hint_for(platform_key: str) -> Optional[str]:
+    """Resolve platform LLM guidance, honoring Telegram rich-message config."""
+    if platform_key == "telegram":
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+        rich_messages = _get_nested_config_bool(
+            config,
+            [
+                ("platforms", "telegram", "extra", "rich_messages"),
+                ("gateway", "platforms", "telegram", "extra", "rich_messages"),
+                ("telegram", "rich_messages"),
+            ],
+        )
+        if rich_messages is False:
+            return TELEGRAM_MARKDOWN_V2_HINT
+    if platform_key in PLATFORM_HINTS:
+        return PLATFORM_HINTS[platform_key]
+    return None
 
 
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
@@ -319,8 +365,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         )
 
     platform_key = (agent.platform or "").lower().strip()
-    if platform_key in PLATFORM_HINTS:
-        stable_parts.append(PLATFORM_HINTS[platform_key])
+    platform_hint = _platform_hint_for(platform_key)
+    if platform_hint:
+        stable_parts.append(platform_hint)
     elif platform_key:
         # Check plugin registry for platform-specific LLM guidance
         try:

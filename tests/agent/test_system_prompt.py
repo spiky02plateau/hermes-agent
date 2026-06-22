@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.system_prompt import build_system_prompt_parts
+from agent.prompt_builder import TELEGRAM_MARKDOWN_V2_HINT
 
 
 def _make_agent(**overrides):
@@ -65,6 +66,30 @@ def _stable_prompt(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
+
+
+class TestTelegramPlatformHint:
+    def test_uses_markdown_v2_hint_when_rich_messages_disabled(self):
+        agent = _make_agent(platform="telegram")
+
+        with patch(
+            "agent.system_prompt.load_config",
+            return_value={"telegram": {"rich_messages": False}},
+        ):
+            stable = _stable_prompt(agent)
+
+        assert TELEGRAM_MARKDOWN_V2_HINT in stable
+        assert "rich Markdown" not in stable
+        assert "Prefer bullets or key:value lists instead of Markdown tables" in stable
+
+    def test_uses_rich_hint_by_default(self):
+        agent = _make_agent(platform="telegram")
+
+        with patch("agent.system_prompt.load_config", return_value={}):
+            stable = _stable_prompt(agent)
+
+        assert "rich Markdown" in stable
+        assert TELEGRAM_MARKDOWN_V2_HINT not in stable
 
 
 class TestCodingContextBlock:

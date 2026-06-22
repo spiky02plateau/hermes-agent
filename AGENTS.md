@@ -254,9 +254,12 @@ hermes-agent/
 ├── acp_adapter/          # ACP server (VS Code / Zed / JetBrains integration)
 ├── cron/                 # Scheduler — jobs.py, scheduler.py
 ├── scripts/              # run_tests.sh, release.py, auxiliary scripts
+├── docs/                 # plans plus docs/solutions/ documented fixes/patterns with YAML frontmatter
 ├── website/              # Docusaurus docs site
 └── tests/                # Pytest suite (~17k tests across ~900 files as of May 2026)
 ```
+
+`CONCEPTS.md` at the repo root is the shared domain vocabulary for project-specific entities, processes, and status concepts. `docs/solutions/` captures documented solutions to past bugs, best practices, and workflow patterns; entries are organized by category with frontmatter such as `module`, `tags`, and `problem_type`, and are relevant when implementing or debugging in documented areas.
 
 **User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys only).
 **Logs:** `~/.hermes/logs/` — `agent.log` (INFO+), `errors.log` (WARNING+),

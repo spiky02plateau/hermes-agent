@@ -479,6 +479,24 @@ STEER_CHANNEL_NOTE = (
 # message representation stays consistent ("system" everywhere).
 DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 
+TELEGRAM_MARKDOWN_V2_HINT = (
+    "You are on a text messaging communication platform, Telegram. "
+    "Standard Markdown is automatically converted to Telegram MarkdownV2 formatting. "
+    "Supported: **bold**, *italic*, ~~strikethrough~~, ||spoiler||, "
+    "`inline code`, ```code blocks```, [links](url), and ## headers. "
+    "Telegram MarkdownV2 has NO native table syntax and does not support "
+    "rich constructs like task lists, collapsible details, footnotes, math, "
+    "underline, subscript/superscript, marked text, or anchors. Prefer bullets "
+    "or key:value lists instead of Markdown tables, and keep formatting simple "
+    "so the rendered message stays compact on mobile. "
+    "You can send media files natively: to deliver a file to the user, "
+    "include MEDIA:/absolute/path/to/file in your response. Images "
+    "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
+    "bubbles, and videos (.mp4) play inline. You can also include image "
+    "URLs in markdown format ![alt](url) and they will be sent as native photos."
+)
+
+
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
